@@ -33,6 +33,7 @@ EVENT_NAMES = {
     "billing_charge_failed": "Billing Charge Failed",
     "printer_offline": "Printer Offline",
     "printer_error": "Printer Error",
+    "ai_failure_detection": "AI Failure Detection",
     "filament_low": "Filament Low",
     "maintenance_due": "Maintenance Due",
     "test": "Test Notification",

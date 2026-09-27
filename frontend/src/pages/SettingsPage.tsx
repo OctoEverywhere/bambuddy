@@ -121,7 +121,7 @@ registerSettingsSearch({ labelKey: 'settings.filamentTracking', tab: 'filament',
 registerSettingsSearch({ labelKey: 'settings.catalog.spoolCatalog', labelFallback: 'Spool Catalog', tab: 'filament', keywords: 'spool catalog entries brand material reset import export', anchor: 'card-spool-catalog' });
 registerSettingsSearch({ labelKey: 'settings.colorCatalog.title', labelFallback: 'Color Catalog', tab: 'filament', keywords: 'color catalog hex swatch palette sync reset', anchor: 'card-color-catalog' });
 // Failure detection sub-cards
-registerSettingsSearch({ labelKey: 'settings.tabs.failureDetection', labelFallback: 'Failure Detection', tab: 'failure-detection', keywords: 'failure detection ai ml obico spaghetti detect monitoring', anchor: 'card-fd-ml' });
+registerSettingsSearch({ labelKey: 'settings.tabs.failureDetection', labelFallback: 'Failure Detection', tab: 'failure-detection', keywords: 'failure detection ai ml obico octoeverywhere spaghetti detect monitoring api key confidence', anchor: 'card-fd-provider' });
 registerSettingsSearch({ labelKey: 'failureDetection.perPrinterTitle', labelFallback: 'Per-Printer Settings', tab: 'failure-detection', keywords: 'failure detection per printer enable per-printer sensitivity', anchor: 'card-fd-perprinter' });
 registerSettingsSearch({ labelKey: 'failureDetection.statusTitle', labelFallback: 'Detection Status', tab: 'failure-detection', keywords: 'failure detection status running connection', anchor: 'card-fd-status' });
 registerSettingsSearch({ labelKey: 'failureDetection.historyTitle', labelFallback: 'Detection History', tab: 'failure-detection', keywords: 'failure detection history log events', anchor: 'card-fd-history' });
@@ -246,11 +246,11 @@ export function SettingsPage() {
   const [isRebuildLoading, setIsRebuildLoading] = useState(false);
   const [defaultView, setDefaultViewState] = useState<string>(getDefaultView());
 
-  // Initialize tab from URL params (handle legacy ?tab=email → users tab + email sub-tab)
+  // Read the active tab from the URL so in-page links and browser navigation
+  // stay in sync (handle legacy ?tab=email → users tab + email sub-tab).
   const tabParam = searchParams.get('tab');
   const isLegacyEmailTab = tabParam === 'email';
-  const initialTab = isLegacyEmailTab ? 'users' : (tabParam && validTabs.includes(tabParam as TabType) ? tabParam as TabType : 'general');
-  const [activeTab, setActiveTab] = useState<TabType>(initialTab);
+  const activeTab = isLegacyEmailTab ? 'users' : (tabParam && validTabs.includes(tabParam as TabType) ? tabParam as TabType : 'general');
   const [usersSubTab, setUsersSubTab] = useState<UsersSubTab>(isLegacyEmailTab ? 'email' : 'users');
   // Workflow tab sub-tabs (#1425): 'dispatch' = current Workflow content,
   // 'pipelines' = Slicer Pipelines management. URL: ?tab=queue&sub=pipelines.
@@ -260,7 +260,6 @@ export function SettingsPage() {
 
   // Update URL when tab changes
   const handleTabChange = (tab: TabType) => {
-    setActiveTab(tab);
     if (tab === 'users') {
       setUsersSubTab('users');
     }
@@ -590,13 +589,21 @@ export function SettingsPage() {
   const spoolbuddyDeviceCount = spoolbuddyDevices?.length ?? 0;
   const spoolbuddyAnyOnline = spoolbuddyDevices?.some((d) => d.online) ?? false;
 
-  // Obico failure-detection service status for tab indicator
+  // Failure-detection service status for tab indicator
   const { data: obicoStatus } = useQuery({
     queryKey: ['obico-status'],
     queryFn: api.getObicoStatus,
     refetchInterval: 15000,
   });
-  const obicoActive = !!(obicoStatus?.is_running && obicoStatus?.enabled);
+  const { data: octoEverywhereStatus } = useQuery({
+    queryKey: ['octoeverywhere-status'],
+    queryFn: api.getOctoEverywhereStatus,
+    refetchInterval: 10000,
+  });
+  const failureDetectionActive = !!(
+    (obicoStatus?.is_running && obicoStatus?.enabled) ||
+    (octoEverywhereStatus?.is_running && octoEverywhereStatus?.enabled)
+  );
 
   const { data: ffmpegStatus } = useQuery({
     queryKey: ['ffmpeg-status'],
@@ -1728,7 +1735,7 @@ export function SettingsPage() {
         >
           <ScanEye className="w-4 h-4" />
           {t('settings.tabs.failureDetection')}
-          <span className={`w-2 h-2 rounded-full ${obicoActive ? 'bg-green-400' : 'bg-gray-500'}`} />
+          <span className={`w-2 h-2 rounded-full ${failureDetectionActive ? 'bg-green-400' : 'bg-gray-500'}`} />
         </button>
         <button
           onClick={() => handleTabChange('users')}

@@ -653,6 +653,28 @@ class TestFrameCache:
         assert await pop_frame("aging-nonce") is None
 
 
+class TestProviderSwitch:
+    async def test_refresh_cancels_inflight_poll_before_it_can_act(self):
+        import asyncio
+
+        svc = ObicoDetectionService()
+        started = asyncio.Event()
+        action = AsyncMock()
+
+        async def pending_poll():
+            started.set()
+            await asyncio.Future()
+            await action()
+
+        svc._task = asyncio.create_task(pending_poll())
+        await started.wait()
+        with patch.object(svc, "start", new_callable=AsyncMock) as restart:
+            await svc.refresh_settings()
+        action.assert_not_awaited()
+        restart.assert_awaited_once()
+        assert svc._task is None
+
+
 class TestCheckPrinterUsesCachedFrameUrl:
     """The URL sent to Obico must point at our nonce endpoint, not /camera/snapshot."""
 

@@ -13,7 +13,14 @@ from backend.app.models.printer import Printer
 logger = logging.getLogger(__name__)
 
 
-async def execute_action(printer_id: int, action: str, task_name: str, score: float) -> None:
+async def execute_action(
+    printer_id: int,
+    action: str,
+    task_name: str,
+    score: float | None,
+    *,
+    print_quality: int | None = None,
+) -> None:
     """Run the configured action for a detected print failure.
 
     action: 'notify' | 'pause' | 'pause_and_off'
@@ -26,7 +33,7 @@ async def execute_action(printer_id: int, action: str, task_name: str, score: fl
     if action == "pause_and_off":
         await _turn_off_linked_plugs(printer_id)
 
-    await _notify(printer_id, printer_name, task_name, score, action)
+    await _notify(printer_id, printer_name, task_name, score, action, print_quality=print_quality)
 
 
 async def _get_printer_name(printer_id: int) -> str:
@@ -41,10 +48,10 @@ def _pause_print(printer_id: int) -> None:
 
     client = printer_manager.get_client(printer_id)
     if not client:
-        logger.warning("Obico pause: no MQTT client for printer %s", printer_id)
+        logger.warning("AI failure detection: no MQTT client for printer %s", printer_id)
         return
     if not client.pause_print():
-        logger.warning("Obico pause: pause_print() returned False for printer %s", printer_id)
+        logger.warning("AI failure detection: pause_print() returned False for printer %s", printer_id)
 
 
 async def _turn_off_linked_plugs(printer_id: int) -> None:
@@ -58,12 +65,20 @@ async def _turn_off_linked_plugs(printer_id: int) -> None:
             try:
                 service = await smart_plug_manager.get_service_for_plug(plug, db)
                 await service.turn_off(plug)
-                logger.info("Obico action: turned off plug %s for printer %s", plug.name, printer_id)
+                logger.info("AI failure detection: turned off plug %s for printer %s", plug.name, printer_id)
             except Exception as e:
-                logger.error("Obico action: failed to turn off plug %s: %s", plug.name, e)
+                logger.error("AI failure detection: failed to turn off plug %s: %s", plug.name, e)
 
 
-async def _notify(printer_id: int, printer_name: str, task_name: str, score: float, action: str) -> None:
+async def _notify(
+    printer_id: int,
+    printer_name: str,
+    task_name: str,
+    score: float | None,
+    action: str,
+    *,
+    print_quality: int | None = None,
+) -> None:
     """Fire the AI Failure Detection notification (#1794).
 
     Routed to its own event in 0.2.5b1; previously rode the multiplexed
@@ -81,6 +96,7 @@ async def _notify(printer_id: int, printer_name: str, task_name: str, score: flo
                 confidence=score,
                 action=action,
                 db=db,
+                print_quality=print_quality,
             )
         except Exception as e:
-            logger.error("Obico notify failed for printer %s: %s", printer_id, e)
+            logger.error("AI failure detection notify failed for printer %s: %s", printer_id, e)

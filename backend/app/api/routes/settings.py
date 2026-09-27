@@ -37,6 +37,7 @@ _SENSITIVE_FIELDS_FOR_API_KEY = (
     "prometheus_token",
     "virtual_printer_access_code",
     "ldap_bind_password",
+    "octoeverywhere_api_key",
 )
 
 
@@ -260,6 +261,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "queue_keep_warm_bed_temp",
             "queue_keep_warm_max_minutes",
             "queue_max_concurrent_uploads",
+            "octoeverywhere_poll_interval",
         ]:
             settings_dict[setting.key] = int(setting.value)
         elif setting.key == "default_printer_id":
@@ -277,6 +279,10 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
 
     # ldap_bind_password is never returned to any caller
     settings_dict["ldap_bind_password"] = ""
+
+    # The saved key is write-only, including for authenticated administrators.
+    settings_dict["octoeverywhere_api_key_configured"] = bool(settings_dict["octoeverywhere_api_key"].strip())
+    settings_dict["octoeverywhere_api_key"] = ""
 
     if is_api_key:
         for field in _SENSITIVE_FIELDS_FOR_API_KEY:
@@ -305,6 +311,18 @@ async def update_settings(
 ):
     """Update application settings."""
     update_data = settings_update.model_dump(exclude_unset=True)
+
+    # Omitted/null preserves the saved key; an explicit empty string removes it.
+    if update_data.get("octoeverywhere_api_key") is None:
+        update_data.pop("octoeverywhere_api_key", None)
+
+    # Only one failure detection provider may control a print at a time.
+    if update_data.get("obico_enabled") and update_data.get("octoeverywhere_enabled"):
+        raise HTTPException(status_code=400, detail="Enable only one AI failure detection provider at a time.")
+    if update_data.get("octoeverywhere_enabled"):
+        update_data["obico_enabled"] = False
+    elif update_data.get("obico_enabled"):
+        update_data["octoeverywhere_enabled"] = False
 
     # Safety refusals on disabling local login (#1589). Two failure modes
     # would otherwise lock everyone out of the install:
@@ -359,6 +377,15 @@ async def update_settings(
     await db.commit()
     # Expire all objects to ensure fresh reads after commit
     db.expire_all()
+
+    if update_data.get("obico_enabled") is False:
+        from backend.app.services.obico_detection import obico_detection_service
+
+        await obico_detection_service.refresh_settings()
+    if any(key.startswith("octoeverywhere_") for key in update_data):
+        from backend.app.services.octoeverywhere_detection import octoeverywhere_detection_service
+
+        await octoeverywhere_detection_service.refresh_settings()
 
     # Reconfigure MQTT relay if any MQTT settings changed
     if mqtt_updated:

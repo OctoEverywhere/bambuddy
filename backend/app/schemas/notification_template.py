@@ -19,6 +19,7 @@ class EventType(StrEnum):
     BILLING_CHARGE_FAILED = "billing_charge_failed"
     PRINTER_OFFLINE = "printer_offline"
     PRINTER_ERROR = "printer_error"
+    AI_FAILURE_DETECTION = "ai_failure_detection"
     FILAMENT_LOW = "filament_low"
     MAINTENANCE_DUE = "maintenance_due"
     AMS_HUMIDITY_HIGH = "ams_humidity_high"
@@ -76,6 +77,16 @@ EVENT_VARIABLES: dict[str, list[str]] = {
     "billing_charge_failed": ["printer", "filename", "archive_id", "error", "timestamp", "app_name"],
     "printer_offline": ["printer", "timestamp", "app_name"],
     "printer_error": ["printer", "error_type", "error_detail", "timestamp", "app_name"],
+    "ai_failure_detection": [
+        "printer",
+        "task_name",
+        "provider",
+        "confidence",
+        "print_quality",
+        "action",
+        "timestamp",
+        "app_name",
+    ],
     "filament_low": ["printer", "slot", "remaining_percent", "color", "timestamp", "app_name"],
     "maintenance_due": ["printer", "items", "timestamp", "app_name"],
     "ams_humidity_high": ["printer", "ams_label", "humidity", "threshold", "timestamp", "app_name"],
@@ -187,6 +198,16 @@ SAMPLE_DATA: dict[str, dict[str, str]] = {
         "printer": "Bambu X1C",
         "error_type": "AMS Error",
         "error_detail": "Filament slot 1 jammed",
+        "timestamp": "2024-01-15 14:30",
+        "app_name": "Bambuddy",
+    },
+    "ai_failure_detection": {
+        "printer": "Bambu X1C",
+        "task_name": "Benchy.3mf",
+        "provider": "OctoEverywhere",
+        "confidence": "N/A",
+        "print_quality": "2/10",
+        "action": "pause",
         "timestamp": "2024-01-15 14:30",
         "app_name": "Bambuddy",
     },
