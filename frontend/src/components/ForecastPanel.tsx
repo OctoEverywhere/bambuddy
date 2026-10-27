@@ -18,6 +18,7 @@ import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
 import { useUiSettings } from '../hooks/useUiSettings';
 import { ConfirmModal } from './ConfirmModal';
+import { parseUTCDate } from '../utils/date';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -27,7 +28,21 @@ interface SkuGroup {
   subtype: string | null;
   brand: string | null;
   colorName: string | null;
+  /** The SKU's stock: its spools that are not archived. */
   spools: InventorySpool[];
+  /** Spools archived in the last ARCHIVED_RATE_WINDOW_DAYS: no stock, but what
+   *  they were used for counts towards the rate (#3399). */
+  usedUp: InventorySpool[];
+}
+
+// An archived spool counts towards its SKU's rate for this long after it was
+// archived; older ones would stretch the estimate over years and dilute it.
+// Same as stock_forecast.ARCHIVED_RATE_WINDOW_DAYS in the backend.
+const ARCHIVED_RATE_WINDOW_DAYS = 90;
+
+function archivedCounts(archivedAt: string, now: number): boolean {
+  const at = parseUTCDate(archivedAt)?.getTime();
+  return at !== undefined && !Number.isNaN(at) && now - at <= ARCHIVED_RATE_WINDOW_DAYS * 86400000;
 }
 
 interface SkuForecast {
@@ -232,9 +247,17 @@ export function ForecastPanel({ spools }: { spools: InventorySpool[] }) {
     for (const spool of spools) {
       if (spool.archived_at) continue;
       const key = skuKey(spool.material, spool.subtype, spool.brand, spool.color_name);
-      const g = map.get(key) ?? { key, material: spool.material, subtype: spool.subtype, brand: spool.brand, colorName: spool.color_name, spools: [] };
+      const g = map.get(key) ?? { key, material: spool.material, subtype: spool.subtype, brand: spool.brand, colorName: spool.color_name, spools: [], usedUp: [] };
       g.spools.push(spool);
       map.set(key, g);
+    }
+    // Used-up spools are archived. They are not stock, and a SKU with nothing
+    // left is not forecast, but leaving out what they took makes a SKU in weekly
+    // use look untouched (#3399).
+    const now = Date.now();
+    for (const spool of spools) {
+      if (!spool.archived_at || !archivedCounts(spool.archived_at, now)) continue;
+      map.get(skuKey(spool.material, spool.subtype, spool.brand, spool.color_name))?.usedUp.push(spool);
     }
     return [...map.values()];
   }, [spools]);
@@ -256,14 +279,16 @@ export function ForecastPanel({ spools }: { spools: InventorySpool[] }) {
 
       const totalRemainingG = group.spools.reduce((s, sp) => s + Math.max(0, sp.label_weight - sp.weight_used), 0);
       const totalLabelG = group.spools.reduce((s, sp) => s + sp.label_weight, 0);
+      const rateSpools = [...group.spools, ...group.usedUp];
       // Consumed since baseline (post-reset); see InventoryPage stats calc (#1390).
-      const totalUsedG = group.spools.reduce((s, sp) => s + Math.max(0, sp.weight_used - (sp.weight_used_baseline ?? 0)), 0);
+      // Used-up spools included: it ranks the most-used SKUs.
+      const totalUsedG = rateSpools.reduce((s, sp) => s + Math.max(0, sp.weight_used - (sp.weight_used_baseline ?? 0)), 0);
 
       // Only include history from spools that haven't been reset — pre-reset
       // events on a reset spool have no anchor timestamp so they'd inflate the
       // rate. Spools without a baseline are clean and keep their records.
       const groupHistory: SpoolUsageRecord[] = [];
-      for (const s of group.spools) {
+      for (const s of rateSpools) {
         if ((s.weight_used_baseline ?? 0) === 0) {
           groupHistory.push(...(usageBySpoolId.get(s.id) ?? []));
         }
@@ -279,7 +304,7 @@ export function ForecastPanel({ spools }: { spools: InventorySpool[] }) {
         dailyRateStdDev = histResult.stdDev;
         rateTier = 'history';
       } else {
-        const delta = computeDeltaRate(group.spools);
+        const delta = computeDeltaRate(rateSpools);
         if (delta !== null) { dailyRateG = delta; rateTier = 'delta'; }
       }
 
