@@ -81,6 +81,14 @@ function skuKey(material: string, subtype: string | null, brand: string | null, 
   return `${material}||${subtype ?? ''}||${brand ?? ''}||${colorName ?? ''}`;
 }
 
+/** A SKU's name for people. In Spoolman mode a filament with no colour name
+ *  gets its subtype as one ("PLA Basic" named "Black"), which printed the word
+ *  twice: "Bambu Lab PLA Basic Black Black" (#3400). The key keeps the colour. */
+function skuLabel(brand: string | null, material: string, subtype: string | null, colorName: string | null) {
+  const sameAsSubtype = !!colorName && !!subtype && colorName.trim().toLowerCase() === subtype.trim().toLowerCase();
+  return [brand, material, subtype, sameAsSubtype ? null : colorName].filter(Boolean).join(' ');
+}
+
 function addDays(date: Date, days: number): Date {
   const d = new Date(date);
   d.setDate(d.getDate() + Math.round(days));
@@ -653,7 +661,7 @@ function SortableTh({
 
 function AlertBanner({ forecast: f, onCart }: { forecast: SkuForecast; onCart: () => void }) {
   const { t } = useTranslation();
-  const label = [f.group.brand, f.group.material, f.group.subtype, f.group.colorName].filter(Boolean).join(' ');
+  const label = skuLabel(f.group.brand, f.group.material, f.group.subtype, f.group.colorName);
   const isBreak = f.stockBreakAlert;
 
   return (
@@ -701,7 +709,7 @@ function UsageChart({ forecasts, days: maxDays, onDaysChange }: {
 
   const series = forecasts.map((f, idx) => ({
     key: f.group.key,
-    label: [f.group.brand, f.group.material, f.group.subtype, f.group.colorName].filter(Boolean).join(' '),
+    label: skuLabel(f.group.brand, f.group.material, f.group.subtype, f.group.colorName),
     color: CHART_COLORS[idx % CHART_COLORS.length],
     rop: f.reorderPointG,
     points: buildProjectionSeries(f, maxDays),
@@ -909,7 +917,7 @@ function ForecastRow({
 
   const snoozed = f.settings?.alerts_snoozed ?? false;
 
-  const label = [f.group.brand, f.group.material, f.group.subtype, f.group.colorName].filter(Boolean).join(' ');
+  const label = skuLabel(f.group.brand, f.group.material, f.group.subtype, f.group.colorName);
   // Use getSwatchStyle so a Clear (alpha=00) lead spool renders as a
   // checkerboard rather than collapsing to solid black (#1545).
   const colorStyle = f.group.spools[0]?.rgba ? getSwatchStyle(f.group.spools[0].rgba) : { backgroundColor: '#4B5563' };
@@ -1464,7 +1472,7 @@ function ShoppingListPanel({
             </thead>
             <tbody className="divide-y divide-bambu-dark-tertiary">
               {items.map((item) => {
-                const lbl = [item.brand, item.material, item.subtype, item.color_name].filter(Boolean).join(' ');
+                const lbl = skuLabel(item.brand, item.material, item.subtype, item.color_name);
                 const hasBreak = breakAlerts.some((a) => a.item.id === item.id);
                 const f = forecastMap.get(skuKey(item.material, item.subtype, item.brand, item.color_name)) ?? null;
                 const avgSpoolG = f && f.totalSpools > 0 ? f.totalLabelG / f.totalSpools : 1000;
@@ -1596,7 +1604,7 @@ function CartLogisticsRow({
   onRemove: () => void;
 }) {
   const { t } = useTranslation();
-  const label = [item.brand, item.material, item.subtype, item.color_name].filter(Boolean).join(' ');
+  const label = skuLabel(item.brand, item.material, item.subtype, item.color_name);
 
   // Build a timeline showing stock depletion, arrival bump, then post-arrival depletion.
   // Two points are inserted at day `lt` (just-before and just-after arrival) so the
@@ -1831,7 +1839,7 @@ function AddToCartModal({
   onAdd: (item: { material: string; subtype: string | null; brand: string | null; color_name: string | null; quantity_spools: number; note: string | null }) => void;
 }) {
   const { t } = useTranslation();
-  const label = [f.group.brand, f.group.material, f.group.subtype, f.group.colorName].filter(Boolean).join(' ');
+  const label = skuLabel(f.group.brand, f.group.material, f.group.subtype, f.group.colorName);
   const [mode, setMode] = useState<'qty' | 'duration'>('qty');
   const [qty, setQty] = useState('1');
   const [durationDays, setDurationDays] = useState('30');
