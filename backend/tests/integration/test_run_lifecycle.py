@@ -750,3 +750,144 @@ async def test_a_late_end_of_an_earlier_job_leaves_the_running_print_alone(test_
     assert [(r.status, r.subtask_id) for r in await _all_runs(db_session, farm.archive)] == [("printing", running_job)]
     archive = await db_session.get(PrintArchive, farm.archive)
     assert archive.status == "printing"
+
+
+async def test_the_archive_shows_its_latest_run(test_engine, db_session, farm, printer_factory):
+    """Plate 1 ends while plate 2 still prints: the archive is left as plate
+    1's end wrote it -- the reconcile, the next end and the timelapse still
+    go by its printer, status and start. When plate 2 ends, the last of its
+    prints, it shows plate 2's outcome."""
+    other = await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+
+    await _complete(test_engine, farm.printer, "failed", name=SUBTASK)
+    runs = {r.printer_id: r for r in await _all_runs(db_session, farm.archive)}
+    archive = await db_session.get(PrintArchive, farm.archive)
+    await db_session.refresh(archive)
+    assert (archive.status, archive.printer_id, archive.started_at) == ("failed", other, runs[other].started_at)
+
+    await _complete(test_engine, other, "completed", name=SUBTASK)
+    runs = {r.printer_id: r for r in await _all_runs(db_session, farm.archive)}
+    archive = await db_session.get(PrintArchive, farm.archive)
+    await db_session.refresh(archive)
+    assert (archive.status, archive.started_at, archive.completed_at, archive.plate_id, archive.failure_reason) == (
+        "completed",
+        runs[other].started_at,
+        runs[other].completed_at,
+        2,
+        None,
+    )
+
+
+async def test_the_end_of_an_earlier_start_does_not_take_the_card(test_engine, db_session, farm, printer_factory):
+    """Plate 2 started later and ended first; plate 1 ends after it. The
+    archive shows the latest start, plate 2, not the last end."""
+    other = await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+
+    await _complete(test_engine, other, "completed", name=SUBTASK)
+    await _complete(test_engine, farm.printer, "failed", name=SUBTASK)
+
+    archive = await db_session.get(PrintArchive, farm.archive)
+    await db_session.refresh(archive)
+    assert (archive.status, archive.plate_id) == ("completed", 2)
+
+
+async def test_the_notification_of_an_end_has_its_runs_time(test_engine, db_session, farm, printer_factory):
+    """Plate 1's end is notified with plate 1's duration, not the time since
+    plate 2 started (the archive's start)."""
+    await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+
+    notif = await _complete(test_engine, farm.printer, "completed", name=SUBTASK)
+
+    archive_data = notif.on_print_complete.await_args.kwargs["archive_data"]
+    assert archive_data["actual_time_seconds"] is not None and archive_data["actual_time_seconds"] >= 1
+
+
+async def test_a_run_edited_in_the_print_log_is_shown_on_its_archive(test_engine, db_session, farm, async_client):
+    await _run(test_engine, db_session, farm, plate=1, status="failed", run_id="run-1")
+    [run] = await _runs(db_session, farm.archive)
+
+    response = await async_client.patch(
+        f"/api/v1/print-log/{run.id}", json={"status": "completed", "failure_reason": ""}
+    )
+    assert response.status_code == 200, response.text
+
+    archive = await db_session.get(PrintArchive, farm.archive)
+    await db_session.refresh(archive)
+    assert (archive.status, archive.failure_reason) == ("completed", None)
+
+
+async def test_an_edit_of_the_archive_lands_on_its_latest_started_run(db_session, farm, async_client):
+    """The run the card shows is the latest start; with plates ended the
+    other way round that is not the highest id."""
+    from datetime import datetime
+
+    later = PrintLogEntry(
+        archive_id=farm.archive, printer_id=farm.printer, status="completed", started_at=datetime(2026, 10, 30, 10)
+    )
+    earlier = PrintLogEntry(
+        archive_id=farm.archive, printer_id=farm.printer, status="completed", started_at=datetime(2026, 10, 30, 8)
+    )
+    db_session.add(later)
+    await db_session.flush()
+    db_session.add(earlier)
+    await db_session.commit()
+
+    response = await async_client.patch(
+        f"/api/v1/archives/{farm.archive}", json={"status": "failed", "failure_reason": "spaghetti"}
+    )
+    assert response.status_code == 200, response.text
+
+    db_session.expire_all()
+    rows = {r.started_at.hour: (r.status, r.failure_reason) for r in await _runs(db_session, farm.archive)}
+    assert rows == {10: ("failed", "spaghetti"), 8: ("completed", None)}
+
+
+async def test_the_latest_run_is_the_latest_start(db_session, farm):
+    """Runs written at their end (before runs were opened at the start) are
+    numbered by their end; the card's run is still the latest start."""
+    from datetime import datetime
+
+    from backend.app.services.print_log import mirror_latest_run
+
+    db_session.add(
+        PrintLogEntry(
+            archive_id=farm.archive, printer_id=farm.printer, status="failed", started_at=datetime(2026, 10, 30, 10)
+        )
+    )
+    await db_session.flush()
+    db_session.add(
+        PrintLogEntry(
+            archive_id=farm.archive, printer_id=farm.printer, status="completed", started_at=datetime(2026, 10, 30, 8)
+        )
+    )
+    await db_session.flush()
+
+    await mirror_latest_run(db_session, farm.archive)
+
+    archive = await db_session.get(PrintArchive, farm.archive)
+    assert (archive.status, archive.started_at) == ("failed", datetime(2026, 10, 30, 10))
+
+
+async def test_a_later_plates_end_leaves_no_printing_archive_for_its_reconnect(
+    test_engine, db_session, farm, printer_factory
+):
+    """The later-started plate ends first. Its printer's reconnect looks for
+    printing archives of that printer to close: the archive must not be one,
+    or a second end of the print is made up."""
+    from unittest.mock import MagicMock, patch
+
+    from backend.app.main import reconcile_stale_active_prints
+
+    other = await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    await _complete(test_engine, other, "completed", name=SUBTASK)
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    state = MagicMock(connected=True, state="FINISH", subtask_id="", progress=100, layer_num=0)
+    maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    with (
+        patch("backend.app.main.printer_manager.get_status", return_value=state),
+        patch("backend.app.main.async_session", maker),
+    ):
+        assert await reconcile_stale_active_prints(other) == 0
+    assert [r.printer_id for r in await _runs(db_session, farm.archive)] == [other]

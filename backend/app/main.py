@@ -10048,8 +10048,15 @@ async def _close_out_print(printer_id: int, data: dict):
 
                 archive_data = None
                 if archive_id:
+                    from backend.app.models.print_log import PrintLogEntry
+
                     archive_result = await db.execute(select(PrintArchive).where(PrintArchive.id == archive_id))
                     archive = archive_result.scalar_one_or_none()
+                    # The run that ended: the archive shows its latest, which
+                    # with another plate of it printing elsewhere is not this.
+                    run = await db.get(PrintLogEntry, completed_run_id) if completed_run_id is not None else None
+                    run_started = run.started_at if run is not None else archive.started_at if archive else None
+                    run_completed = run.completed_at if run is not None else archive.completed_at if archive else None
                     if archive:
                         # Actual elapsed time from started_at/completed_at when both are
                         # populated (every terminal status sets completed_at after #1198).
@@ -10062,11 +10069,11 @@ async def _close_out_print(printer_id: int, data: dict):
                         # as the duration -- 14 h for a night offline (DB-C9).
                         # An estimated end (#3310) gives the estimate.
                         if (
-                            archive.started_at
-                            and archive.completed_at
+                            run_started
+                            and run_completed
                             and (not data.get("_reconciled") or data.get("_reconciled_completed_at"))
                         ):
-                            elapsed = (archive.completed_at - archive.started_at).total_seconds()
+                            elapsed = (run_completed - run_started).total_seconds()
                             if elapsed > 0:
                                 actual_time_seconds = int(elapsed)
 
@@ -10074,7 +10081,7 @@ async def _close_out_print(printer_id: int, data: dict):
                             "print_time_seconds": archive.print_time_seconds,
                             "actual_time_seconds": actual_time_seconds,
                             "actual_filament_grams": archive.filament_used_grams,
-                            "failure_reason": archive.failure_reason,
+                            "failure_reason": run.failure_reason if run is not None else archive.failure_reason,
                             "created_by_id": archive.created_by_id,
                         }
 

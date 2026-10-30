@@ -137,7 +137,47 @@ async def write_log_entry(
     # changes nothing: the repeat no longer has the run's tracked usage, and the
     # entry may have been edited or given its energy since.
     await db.flush()
+    if archive_id is not None:
+        await mirror_latest_run(db, archive_id)
     return entry
+
+
+# What the archive card shows of its prints, its latest run's.
+_MIRRORED_FROM_RUN = ("status", "started_at", "completed_at", "failure_reason")
+
+
+async def mirror_latest_run(db: AsyncSession, archive_id: int) -> None:
+    """Give the archive its latest run's outcome, by start: status, times,
+    failure reason and plate. Only once none of its runs is printing: until
+    the print's start, end, reconcile and timelapse look their print up by
+    its run, they still go by the archive's printer, status and start, which
+    a print running elsewhere must not move under them. While one prints,
+    the archive keeps what its prints' starts and ends wrote. An archive
+    without runs keeps its own (uploaded, or printed before runs were
+    logged). Does not commit."""
+    from backend.app.models.archive import PrintArchive
+
+    archive = await db.get(PrintArchive, archive_id)
+    if archive is None:
+        return
+    runs = select(PrintLogEntry).where(PrintLogEntry.archive_id == archive_id)
+    still_printing = await db.scalar(
+        runs.with_only_columns(PrintLogEntry.id)
+        .where(PrintLogEntry.status == RUN_OPEN)
+        .limit(1)
+        .execution_options(**{INCLUDE_OPEN_RUNS: True})
+    )
+    if still_printing is not None:
+        return
+    latest = await db.scalar(
+        runs.order_by(PrintLogEntry.started_at.desc().nulls_last(), PrintLogEntry.id.desc()).limit(1)
+    )
+    if latest is None:
+        return
+    for name in _MIRRORED_FROM_RUN:
+        setattr(archive, name, getattr(latest, name))
+    if latest.plate_id is not None:
+        archive.plate_id = latest.plate_id
 
 
 async def mirror_archive_cost(

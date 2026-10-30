@@ -2036,10 +2036,12 @@ async def update_archive(
     if to_mirror and previous_status != "printing":
         from backend.app.models.print_log import PrintLogEntry
 
+        # The latest by its start, the run the archive shows: ids follow the
+        # starts too, but plates on two printers can end the other way round.
         latest_entry = await db.scalar(
             select(PrintLogEntry)
             .where(PrintLogEntry.archive_id == archive_id)
-            .order_by(PrintLogEntry.id.desc())
+            .order_by(PrintLogEntry.started_at.desc().nulls_last(), PrintLogEntry.id.desc())
             .limit(1)
         )
         if latest_entry is not None:

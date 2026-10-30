@@ -337,6 +337,12 @@ async def update_print_log_entry(
             raise HTTPException(400, f"Unknown status: {new_status!r}")
         entry.status = new_status
 
+    if entry.archive_id is not None:
+        from backend.app.services.print_log import mirror_latest_run
+
+        # The archive card shows its latest run; this may be it.
+        await mirror_latest_run(db, entry.archive_id)
+
     await db.commit()
     await db.refresh(entry)
 
