@@ -5535,9 +5535,15 @@ async def on_print_start(printer_id: int, data: dict):
                 # key loses no information and gives the Statistics breakdown a
                 # single bucket instead of two untranslatable prose strings.
                 existing_archive.failure_reason = "noStatusUpdate"
+                # And its run, as before runs were opened at the start: a new
+                # print starts on the printer, so whatever is open there ended
+                # unseen. Left open, the next reconnect would close it again.
+                from backend.app.services.print_log import discard_open_runs
+
+                await discard_open_runs(db, printer_id)
                 await db.commit()
                 # Its print keys go with it; the new archive registers its own.
-                for _key in [k for k, v in _active_prints.items() if v == existing_archive.id]:
+                for _key in [k for k, v in _active_prints.items() if v == existing_archive.id and k[0] == printer_id]:
                     del _active_prints[_key]
                 # Fall through to create new archive (don't return)
             else:
@@ -7542,6 +7548,20 @@ async def on_print_running_observed(printer_id: int, data: dict):
     await _capture_timelapse_baseline_at_start(printer, printer_id, logger)
 
 
+class _RunOfArchive:
+    """An archive as one of its runs printed it: the run's job id, start and
+    plate, the rest the archive's. What the reconcile judges and closes."""
+
+    def __init__(self, archive, run):
+        self._archive = archive
+        self.subtask_id = run.subtask_id
+        self.started_at = run.started_at
+        self.plate_id = run.plate_id if run.plate_id is not None else archive.plate_id
+
+    def __getattr__(self, name):
+        return getattr(self._archive, name)
+
+
 def _is_active_archive_stale(archive, state) -> tuple[bool, str]:
     """Return ``(is_stale, reason)`` for an archive in ``status="printing"``
     against the printer's current MQTT state.
@@ -7789,16 +7809,46 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
         return 0
 
     from backend.app.models.archive import PrintArchive
+    from backend.app.models.print_log import INCLUDE_OPEN_RUNS, RUN_OPEN, PrintLogEntry
 
     reconciled = 0
     async with async_session() as db:
+        # The prints on this printer Bambuddy saw start: their runs open here.
+        # The archive row is shared by every plate of a file, its printer, job
+        # and start the latest start's, so each is judged as its run.
+        open_runs = (
+            await db.scalars(
+                select(PrintLogEntry)
+                .where(PrintLogEntry.printer_id == printer_id, PrintLogEntry.status == RUN_OPEN)
+                .execution_options(**{INCLUDE_OPEN_RUNS: True})
+            )
+        ).all()
+        by_run = {
+            archive.id: archive
+            for archive in (
+                await db.scalars(
+                    select(PrintArchive).where(
+                        PrintArchive.id.in_([run.archive_id for run in open_runs if run.archive_id is not None])
+                    )
+                )
+            ).all()
+        }
+        active: list = [_RunOfArchive(by_run[run.archive_id], run) for run in open_runs if run.archive_id in by_run]
+        # And as before runs were opened at the start: a printing archive of
+        # this printer with no run open anywhere (printing since before).
+        archives_with_open_runs = select(PrintLogEntry.archive_id).where(
+            PrintLogEntry.status == RUN_OPEN, PrintLogEntry.archive_id.is_not(None)
+        )
         result = await db.execute(
-            select(PrintArchive).where(
+            select(PrintArchive)
+            .where(
                 PrintArchive.printer_id == printer_id,
                 PrintArchive.status == "printing",
+                PrintArchive.id.not_in(archives_with_open_runs),
             )
+            .execution_options(**{INCLUDE_OPEN_RUNS: True})
         )
-        active = list(result.scalars().all())
+        active.extend(result.scalars().all())
 
     if not active:
         return 0
@@ -7843,6 +7893,10 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
             "raw_data": state.raw_data or {},
             "_reconciled": True,
         }
+        if isinstance(archive, _RunOfArchive):
+            # The archive it closes, which its names and printer may not find:
+            # another printer's plate of it can have started since.
+            payload["_reconciled_archive_id"] = archive.id
         if outcome != "aborted":
             # The printer's progress and layer are this job's, so a partial
             # run is charged what it printed rather than nothing.
@@ -8881,6 +8935,20 @@ async def _close_out_print(printer_id: int, data: dict):
     # the search matches names by substring.
     bound_archive_id = archive_id
 
+    if not archive_id and data.get("_reconciled") and data.get("_reconciled_archive_id"):
+        # The reconcile names the archive whose run on this printer it
+        # closes. Only while that run is open: the print's real end may have
+        # closed it meanwhile, or closed the print without managing to write
+        # it, and either way there is nothing left to end twice.
+        if await _archive_of_open_run(printer_id) != data["_reconciled_archive_id"]:
+            logger.info(
+                "[RECONCILE] Archive %s has no run open on printer %s any more; nothing to close",
+                data["_reconciled_archive_id"],
+                printer_id,
+            )
+            return
+        archive_id = data["_reconciled_archive_id"]
+
     ending_job = str(data.get("subtask_id") or "").strip()
     if not archive_id and ending_job not in ("", "0"):
         # Not bound (a restart since the start): this job's run, open on the
@@ -9630,6 +9698,8 @@ async def _close_out_print(printer_id: int, data: dict):
                     reconciled=bool(data.get("_reconciled")) and not data.get("_reconciled_completed_at"),
                     # Its time is the estimate or nothing, never measured (#3310).
                     duration_unmeasured=bool(data.get("_reconciled")),
+                    # The real end of a print stopped while its printer was offline.
+                    replaces_offline_stop=True,
                 )
                 await record_archive_wear(db, archive, run_entry)
                 await db.commit()

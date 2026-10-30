@@ -97,6 +97,9 @@ class PrintLogEntry(Base):
     bambuddy_forced_timelapse: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Ended by a stop that could not reach the printer: logged without word
+    # from it. The printer's real end, if it still comes, replaces it.
+    ended_offline: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
 
 @event.listens_for(Session, "do_orm_execute")

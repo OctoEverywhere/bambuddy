@@ -2954,6 +2954,7 @@ async def stop_queue_item(
                 failure_reason=archive.failure_reason,
                 thumbnail_path=archive.thumbnail_path,
                 created_by_id=archive.created_by_id,
+                ended_offline=True,
             )
             closed_archive_id = archive.id
     if not stop_sent:

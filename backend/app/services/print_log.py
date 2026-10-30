@@ -54,6 +54,8 @@ async def write_log_entry(
     created_by_username: str | None = None,
     reconciled: bool = False,
     duration_unmeasured: bool = False,
+    ended_offline: bool = False,
+    replaces_offline_stop: bool = False,
 ) -> PrintLogEntry:
     """Write a print log entry.
 
@@ -70,10 +72,17 @@ async def write_log_entry(
     ``duration_unmeasured`` marks a run closed at reconnect, whose times were
     not measured (#3310): ``completed_at`` is its start plus the slicer's
     estimate, or the reconnect. The time accuracy leaves it out.
+
+    ``ended_offline`` marks a run logged by a stop that could not reach the
+    printer. A print's end passes ``replaces_offline_stop``: it may then fill
+    such a run of its printer, the printer's latest, which its archive's start
+    (another plate's since, maybe) and its closed queue item no longer find.
     """
     entry = await _entry_of_this_run(db, archive_id, printer_id, started_at)
+    if entry is None and replaces_offline_stop and archive_id is not None and printer_id is not None:
+        entry = await _stopped_while_offline(db, archive_id, printer_id)
     filling_open_run = entry is not None and entry.status == RUN_OPEN
-    if entry is not None and filling_open_run and entry.started_at is not None:
+    if entry is not None and entry.started_at is not None:
         # The run's own start. The archive's is its latest run's: another
         # plate of it may have started on another printer since.
         started_at = entry.started_at
@@ -108,6 +117,7 @@ async def write_log_entry(
         "thumbnail_path": thumbnail_path,
         "created_by_id": created_by_id,
         "created_by_username": created_by_username,
+        "ended_offline": True if ended_offline else None,
     }
     if filling_open_run:
         # When the run was logged, as a run written at its end always was:
@@ -284,6 +294,23 @@ async def _entry_of_this_run(
     if entry is not None or exact:
         return entry
     return await _open_run_on(db, archive_id, printer_id)
+
+
+async def _stopped_while_offline(db: AsyncSession, archive_id: int, printer_id: int) -> PrintLogEntry | None:
+    """The run a print's real end replaces after a stop logged while the
+    printer was offline: the printer's latest run, when it is of this
+    archive and was ended that way. A printer prints one thing at a time, so
+    any later run there, of any file, means that print is long over."""
+    latest = await db.scalar(
+        select(PrintLogEntry)
+        .where(PrintLogEntry.printer_id == printer_id)
+        .order_by(PrintLogEntry.started_at.desc().nulls_last(), PrintLogEntry.id.desc())
+        .limit(1)
+        .execution_options(**{INCLUDE_OPEN_RUNS: True})
+    )
+    if latest is not None and latest.archive_id == archive_id and latest.ended_offline:
+        return latest
+    return None
 
 
 async def _open_run_on(db: AsyncSession, archive_id: int, printer_id: int) -> PrintLogEntry | None:

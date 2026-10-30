@@ -891,3 +891,289 @@ async def test_a_later_plates_end_leaves_no_printing_archive_for_its_reconnect(
     ):
         assert await reconcile_stale_active_prints(other) == 0
     assert [r.printer_id for r in await _runs(db_session, farm.archive)] == [other]
+
+
+async def _reconcile(test_engine, printer_id: int, state) -> int:
+    """The reconnect's reconcile on ``printer_id`` against the test database,
+    its synthesised ends run one background task at a time."""
+    from unittest.mock import patch
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from backend.app.main import reconcile_stale_active_prints
+
+    maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    payloads: list[tuple[int, dict]] = []
+
+    async def capture(pid, payload):
+        payloads.append((pid, payload))
+
+    with (
+        patch("backend.app.main.printer_manager.get_status", return_value=state),
+        patch("backend.app.main.async_session", maker),
+        patch("backend.app.main.on_print_complete", side_effect=capture),
+    ):
+        reconciled = await reconcile_stale_active_prints(printer_id)
+    # The ends it synthesised, run as on_print_complete runs them.
+    for pid, payload in payloads:
+        await _complete(
+            test_engine,
+            pid,
+            payload["status"],
+            name=payload["subtask_name"],
+            extra={k: v for k, v in payload.items() if k not in ("status", "subtask_name")},
+        )
+    return reconciled
+
+
+async def test_the_reconnect_closes_its_printers_run_of_a_shared_archive(
+    test_engine, db_session, farm, printer_factory
+):
+    """Plate 1's printer reconnects with its print over; the archive names
+    the other printer, whose plate still prints. Plate 1's run is closed,
+    plate 2's is left running."""
+    from unittest.mock import MagicMock
+
+    other = await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    main_module._active_prints.clear()  # the restart
+    finished = MagicMock(connected=True, state="FINISH", subtask_id="", progress=100, layer_num=0)
+
+    assert await _reconcile(test_engine, farm.printer, finished) == 1
+
+    runs = {r.printer_id: r.status for r in await _all_runs(db_session, farm.archive)}
+    assert runs[other] == "printing"
+    assert runs[farm.printer] != "printing"
+
+
+async def test_the_reconnect_leaves_a_run_still_printing_alone(test_engine, db_session, farm, printer_factory):
+    """The other printer reconnects mid-print, its own job on it: nothing to close."""
+    from unittest.mock import MagicMock
+
+    from sqlalchemy import update
+
+    other = await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    await db_session.execute(
+        update(PrintLogEntry)
+        .where(PrintLogEntry.printer_id == other)
+        .values(subtask_id="job-q")
+        .execution_options(include_open_runs=True)
+    )
+    await db_session.commit()
+    running = MagicMock(
+        connected=True, state="RUNNING", subtask_id="job-q", subtask_name=SUBTASK, progress=40, layer_num=3
+    )
+
+    assert await _reconcile(test_engine, other, running) == 0
+    assert {r.printer_id: r.status for r in await _all_runs(db_session, farm.archive)}[other] == "printing"
+
+
+async def test_a_real_end_after_an_offline_stop_is_one_run_on_a_shared_archive(
+    test_engine, db_session, farm, printer_factory, async_client
+):
+    """Plate 1 is stopped while its printer is offline, after plate 2 started
+    elsewhere (the archive has plate 2's start). Its printer then reports the
+    real end: it replaces the stop, it is not a second run."""
+    from unittest.mock import AsyncMock, patch
+
+    item = PrintQueueItem(printer_id=farm.printer, archive_id=farm.archive, status="printing", position=1, plate_id=1)
+    db_session.add(item)
+    await db_session.commit()
+    item_id = item.id
+    other = await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    own_start = {r.printer_id: r.started_at for r in await _all_runs(db_session, farm.archive)}[farm.printer]
+
+    with (
+        patch("backend.app.services.print_control.stop_print_by_user", return_value=False),
+        patch("backend.app.api.routes.print_queue.ws_manager") as ws,
+    ):
+        ws.send_archive_updated = AsyncMock()
+        assert (await async_client.post(f"/api/v1/queue/{item_id}/stop")).status_code == 200
+    main_module._active_prints[(farm.printer, FILE)] = farm.archive
+
+    await _complete(test_engine, farm.printer, "completed", name=SUBTASK)
+
+    runs = [(r.printer_id, r.status) for r in await _all_runs(db_session, farm.archive)]
+    assert sorted(runs) == sorted([(farm.printer, "completed"), (other, "printing")])
+    ended = {r.printer_id: r for r in await _all_runs(db_session, farm.archive)}[farm.printer]
+    assert ended.started_at == own_start, "timed from its own start, not the other plate's"
+
+
+async def test_a_stale_archive_cancelled_at_the_next_start_keeps_other_printers_bound(farm):
+    """The stale-cancel at a print start drops the archive's bindings on its
+    own printer only: another printer printing a plate of it keeps its own."""
+    import ast
+    from pathlib import Path
+
+    source = Path(main_module.__file__).read_text()
+    tree = ast.parse(source)
+    unbinds = [
+        ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ListComp) and "existing_archive.id" in ast.unparse(node)
+    ]
+    assert unbinds and all("printer_id" in comp for comp in unbinds), unbinds
+
+
+async def test_the_reconnect_closes_a_finished_print_once(test_engine, db_session, farm, printer_factory):
+    """The later plate's printer reconnects with it over. The archive names
+    that printer and still says printing; its run is what is closed, once,
+    not the archive a second time as if it had no run."""
+    from unittest.mock import MagicMock
+
+    other = await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    main_module._active_prints.clear()
+    finished = MagicMock(connected=True, state="FINISH", subtask_id="", progress=100, layer_num=0)
+
+    assert await _reconcile(test_engine, other, finished) == 1
+
+
+async def test_the_reconnect_judges_each_print_by_its_own_job(test_engine, db_session, farm, printer_factory):
+    """Plate 1's printer reconnects running its job; the archive holds the
+    other plate's job id. Plate 1 is not taken for a print that changed."""
+    from unittest.mock import MagicMock
+
+    from sqlalchemy import update
+
+    await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    await db_session.execute(
+        update(PrintLogEntry)
+        .where(PrintLogEntry.printer_id == farm.printer)
+        .values(subtask_id="job-p")
+        .execution_options(include_open_runs=True)
+    )
+    archive = await db_session.get(PrintArchive, farm.archive)
+    archive.subtask_id = "job-q"
+    await db_session.commit()
+    running = MagicMock(
+        connected=True, state="RUNNING", subtask_id="job-p", subtask_name=SUBTASK, progress=40, layer_num=3
+    )
+
+    assert await _reconcile(test_engine, farm.printer, running) == 0
+
+
+async def test_an_end_does_not_take_over_an_earlier_stop_of_the_file(test_engine, db_session, farm):
+    """Stopped from the queue while the printer was online (the same status and
+    reason an offline stop logs), then printed again: the reprint's end
+    writes its own run. Only a stop logged while the printer was offline is
+    the printer's real end to replace."""
+    from datetime import datetime
+
+    db_session.add(
+        PrintLogEntry(
+            archive_id=farm.archive,
+            printer_id=farm.printer,
+            status="cancelled",
+            failure_reason="userCancelled",
+            started_at=datetime(2026, 10, 29, 8),
+            completed_at=datetime(2026, 10, 29, 9),
+        )
+    )
+    archive = await db_session.get(PrintArchive, farm.archive)
+    archive.status = "printing"
+    archive.started_at = datetime(2026, 10, 30, 8)  # printing since before runs were opened
+    await db_session.commit()
+    main_module._active_prints[(farm.printer, FILE)] = farm.archive
+
+    await _complete(test_engine, farm.printer, "completed", name=SUBTASK)
+
+    runs = sorted((r.started_at.day, r.status) for r in await _runs(db_session, farm.archive))
+    assert runs == [(29, "cancelled"), (30, "completed")]
+
+
+async def test_a_second_offline_stop_is_a_run_of_its_own(test_engine, db_session, farm, async_client):
+    """An earlier offline stop of the file on this printer is not this stop."""
+    from datetime import datetime
+    from unittest.mock import AsyncMock, patch
+
+    db_session.add(
+        PrintLogEntry(
+            archive_id=farm.archive,
+            printer_id=farm.printer,
+            status="cancelled",
+            failure_reason="userCancelled",
+            ended_offline=True,
+            started_at=datetime(2026, 10, 29, 8),
+        )
+    )
+    archive = await db_session.get(PrintArchive, farm.archive)
+    archive.status = "printing"
+    archive.started_at = datetime(2026, 10, 30, 8)
+    item = PrintQueueItem(printer_id=farm.printer, archive_id=farm.archive, status="printing", position=1)
+    db_session.add(item)
+    await db_session.commit()
+    item_id = item.id
+
+    with (
+        patch("backend.app.services.print_control.stop_print_by_user", return_value=False),
+        patch("backend.app.api.routes.print_queue.ws_manager") as ws,
+    ):
+        ws.send_archive_updated = AsyncMock()
+        assert (await async_client.post(f"/api/v1/queue/{item_id}/stop")).status_code == 200
+
+    assert len(await _runs(db_session, farm.archive)) == 2
+
+
+async def test_a_reconcile_after_the_real_end_closes_nothing(test_engine, db_session, farm, printer_factory):
+    """The reconcile read the printer's runs while plate 1 still printed; the
+    real end closed it before the synthesised one ran. That one ends nothing."""
+    from unittest.mock import MagicMock, patch
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from backend.app.main import reconcile_stale_active_prints
+
+    await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    payloads: list[dict] = []
+
+    async def capture(pid, payload):
+        payloads.append(payload)
+
+    finished = MagicMock(connected=True, state="FINISH", subtask_id="", progress=100, layer_num=0)
+    with (
+        patch("backend.app.main.printer_manager.get_status", return_value=finished),
+        patch("backend.app.main.async_session", maker),
+        patch("backend.app.main.on_print_complete", side_effect=capture),
+    ):
+        await reconcile_stale_active_prints(farm.printer)
+    await _complete(test_engine, farm.printer, "completed", name=SUBTASK)  # the real end, first
+    [payload] = payloads
+
+    await _complete(
+        test_engine,
+        farm.printer,
+        payload["status"],
+        name=payload["subtask_name"],
+        extra={k: v for k, v in payload.items() if k not in ("status", "subtask_name")},
+    )
+
+    mine = [r.status for r in await _all_runs(db_session, farm.archive) if r.printer_id == farm.printer]
+    assert mine == ["completed"]
+
+
+async def test_a_stale_archive_cancelled_at_the_next_start_leaves_no_run_open(test_engine, db_session, farm):
+    """A print whose end was never seen, its archive cancelled as stale when
+    the next print starts: its run goes too, even when the new print's own
+    run is not opened, or the next reconnect would close it a second time."""
+    from datetime import datetime, timedelta
+    from unittest.mock import AsyncMock, patch
+
+    started = datetime.utcnow() - timedelta(hours=3)
+    archive = await db_session.get(PrintArchive, farm.archive)
+    archive.status = "printing"
+    archive.started_at = started
+    archive.created_at = started
+    db_session.add(
+        PrintLogEntry(archive_id=farm.archive, printer_id=farm.printer, status="printing", started_at=started)
+    )
+    await db_session.commit()
+
+    with patch("backend.app.main._open_run_for", AsyncMock()):
+        await _drive_print_start(
+            test_engine, SimpleNamespace(id=farm.printer), download_ok=False, state_fields={"progress": 0.2}
+        )
+
+    db_session.expire_all()
+    archive = await db_session.get(PrintArchive, farm.archive)
+    assert archive.status == "cancelled"
+    assert await _all_runs(db_session, farm.archive) == []

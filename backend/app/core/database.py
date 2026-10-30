@@ -5942,6 +5942,7 @@ async def _run_migrations(conn):
         ("bambuddy_forced_timelapse", "BOOLEAN"),
         ("notes", "TEXT"),
         ("quantity", "INTEGER"),
+        ("ended_offline", "BOOLEAN"),
     ):
         await _safe_execute(conn, f"ALTER TABLE print_log_entries ADD COLUMN {column} {kind}")
     await _safe_execute(

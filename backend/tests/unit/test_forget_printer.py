@@ -135,10 +135,12 @@ async def test_forget_printer_clears_main_and_keeps_other_printers():
         assert lost == []
         assert (GONE, 100) not in main._print_ams_mappings
         assert (GONE, 200) not in main._print_cost_center_ids
-        assert main._print_plate_ids == {(KEPT, 200): 3}
+        assert (GONE, 200) not in main._print_plate_ids
+        assert main._print_plate_ids.get((KEPT, 200)) == 3
         await asyncio.sleep(0)
         assert all(task.cancelled() for task in pending.values())
     finally:
+        main._print_plate_ids.pop((KEPT, 200), None)
         for entries in (gone, kept):
             for name, (key, value) in entries.items():
                 target = getattr(main, name)
