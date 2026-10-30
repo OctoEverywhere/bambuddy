@@ -7049,6 +7049,7 @@ export default {
       assignToAms: "Назначить в AMS",
       syncWeight: "Синхронизировать массу",
       addToInventory: "Добавить в учёт",
+      quickAddFromTag: 'Добавляет эту катушку с данными, считанными с её метки Bambu. Позже их можно изменить в Bambuddy.',
       assignToAmsTitle: "Назначить в AMS",
       selectSlot: "Выберите слот",
       assign: "Назначить",

@@ -7357,6 +7357,7 @@ export default {
       assignToAms: "AMS'e Ata",
       syncWeight: 'Ağırlığı Senkronize Et',
       addToInventory: 'Envantere Ekle',
+      quickAddFromTag: 'Bu makarayı Bambu etiketinden okunan bilgilerle ekler. Bunları daha sonra Bambuddy içinde düzenleyebilirsiniz.',
       assignToAmsTitle: "AMS'e Ata",
       selectSlot: 'Bir yuva seçin',
       assign: 'Ata',
