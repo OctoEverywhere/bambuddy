@@ -183,13 +183,14 @@ async def _fetch_cloud_presets(
             # that share names with private ones get deduped out within the cloud
             # tier itself.
             seen_names: set[str] = set()
-            for entry in type_data.get("private", []) + type_data.get("public", []):
-                name = entry.get("name")
-                setting_id = entry.get("setting_id") or entry.get("id")
-                if not name or not setting_id or name in seen_names:
-                    continue
-                seen_names.add(name)
-                slots[slot].append(UnifiedPreset(id=setting_id, name=name, source="cloud"))
+            for stock, entries in ((False, type_data.get("private", [])), (True, type_data.get("public", []))):
+                for entry in entries:
+                    name = entry.get("name")
+                    setting_id = entry.get("setting_id") or entry.get("id")
+                    if not name or not setting_id or name in seen_names:
+                        continue
+                    seen_names.add(name)
+                    slots[slot].append(UnifiedPreset(id=setting_id, name=name, source="cloud", stock=stock))
 
         # Cloud filament presets carry no metadata in this response on
         # purpose: the per-preset detail endpoint
@@ -752,6 +753,8 @@ async def list_unified_presets(
     standard = await _fetch_bundled_presets(db, refresh=refresh)
 
     orca_cloud, cloud, local, standard = _enrich_cloud_metadata(orca_cloud, cloud, local, standard)
+    stock_aliases = _stock_aliases(cloud, standard)
+    standard = _drop_aliased(standard, stock_aliases)
 
     return UnifiedPresetsResponse(
         orca_cloud=UnifiedPresetsBySlot(**orca_cloud),
@@ -760,7 +763,62 @@ async def list_unified_presets(
         standard=UnifiedPresetsBySlot(**standard),
         cloud_status=cloud_status,
         orca_cloud_status=orca_cloud_status,
+        stock_aliases=stock_aliases,
     )
+
+
+def _stock_aliases(
+    cloud: dict[str, list[UnifiedPreset]],
+    standard: dict[str, list[UnifiedPreset]],
+) -> dict[str, PresetRef]:
+    """Map each Standard preset with a Bambu Cloud stock twin to that twin (#3386).
+
+    Bambu's stock cloud presets are the bundled ones again, so a name is
+    listed once, under Bambu Cloud: Standard is the preferred sidecar's own
+    bundle (OrcaSlicer's re-authored ``@BBL`` profiles when Orca is
+    preferred), and the cloud copy is the one signed-in users already slice
+    with by default. Signed out there is no cloud list, so nothing is
+    aliased. The keys are ``"standard:<id>"``, so a pipeline or AMS slot
+    saved with a hidden Standard copy resolves to the cloud one.
+    """
+    aliases: dict[str, PresetRef] = {}
+    for slot, presets in cloud.items():
+        twins = {p.name: p for p in presets if p.stock}
+        for p in standard.get(slot, []):
+            twin = twins.get(p.name)
+            if twin is not None:
+                aliases[f"standard:{p.id}"] = PresetRef(source="cloud", id=twin.id)
+    return aliases
+
+
+def _drop_aliased(
+    presets: dict[str, list[UnifiedPreset]], aliases: dict[str, PresetRef]
+) -> dict[str, list[UnifiedPreset]]:
+    """``presets`` without those :func:`_stock_aliases` maps to a twin.
+
+    Runs after :func:`_enrich_cloud_metadata`, so the #2628 bridge has
+    already seen both copies.
+    """
+    return {
+        slot: [p for p in slot_presets if f"{p.source}:{p.id}" not in aliases] for slot, slot_presets in presets.items()
+    }
+
+
+async def load_stock_aliases(db: AsyncSession, user: User | None) -> dict[str, PresetRef]:
+    """The listing's ``stock_aliases`` for ``user``, from the cached tiers.
+
+    For callers that slice from stored refs without the Slice dialog, so a
+    pipeline slices with the profile the dialog shows for it. Both fetches
+    degrade to empty rather than raise, which leaves every ref as stored.
+    """
+    cloud, _status = await _fetch_cloud_presets(db, user)
+    standard = await _fetch_bundled_presets(db)
+    return _stock_aliases(cloud, standard)
+
+
+def listed_ref(aliases: dict[str, PresetRef], ref: PresetRef) -> PresetRef:
+    """The ref the listing shows for ``ref``: its cloud twin if hidden, else itself."""
+    return aliases.get(f"{ref.source}:{ref.id}", ref)
 
 
 def _loaded_spool_tray(raw: dict, ams_id: int, tray_id: int, saved: SlotPresetMapping | None) -> LoadedSpoolTray:
