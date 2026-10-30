@@ -262,6 +262,20 @@ async def _open_run_on(db: AsyncSession, archive_id: int, printer_id: int) -> Pr
     )
 
 
+async def open_run_on_printer(
+    db: AsyncSession, printer_id: int, *, subtask_id: str | None = None
+) -> PrintLogEntry | None:
+    """The run open on the printer: the print it is running now, which
+    Bambuddy saw start. One at most (``open_run``). With ``subtask_id``, only
+    a run of that job."""
+    query = select(PrintLogEntry).where(PrintLogEntry.printer_id == printer_id, PrintLogEntry.status == RUN_OPEN)
+    if subtask_id is not None:
+        query = query.where(PrintLogEntry.subtask_id == subtask_id)
+    return await db.scalar(
+        query.order_by(PrintLogEntry.id.desc()).limit(1).execution_options(**{INCLUDE_OPEN_RUNS: True})
+    )
+
+
 async def discard_open_runs(db: AsyncSession, printer_id: int) -> None:
     """Drop the runs left open on the printer by prints that ended without
     their end reaching a run: cancelled at the next start as stale, or whose

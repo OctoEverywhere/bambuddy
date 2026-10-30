@@ -511,19 +511,21 @@ _expected_prints: dict[tuple[int, str], int] = {}
 # the printer's screen included, so it is no proof of ownership on its own.
 _owned_print_archive_ids: set[int] = set()
 
-# Track AMS mapping for prints: {archive_id: [global_tray_id_per_slot]}
+# What a dispatch registered for its print, keyed (printer_id, archive_id):
+# plates of one archive print on two printers at once, each with its own.
+# Track AMS mapping for prints: {(printer_id, archive_id): [global_tray_id_per_slot]}
 # Used by usage tracker to map 3MF slots to physical AMS trays
-_print_ams_mappings: dict[int, list[int]] = {}
+_print_ams_mappings: dict[tuple[int, int], list[int]] = {}
 
-# Track cost center selection for the current print run: {archive_id: cost_center_id}
-_print_cost_center_ids: dict[int, int] = {}
+# Track cost center selection for the current print run: {(printer_id, archive_id): cost_center_id}
+_print_cost_center_ids: dict[tuple[int, int], int] = {}
 
-# Track plate_id for prints from multi-plate 3MFs: {archive_id: plate_id}
+# Track plate_id for prints from multi-plate 3MFs: {(printer_id, archive_id): plate_id}
 # Used by usage tracker to scope 3MF parsing to the dispatched plate (#1697).
 # Populated by direct-Print and queue dispatch paths; queue prints also have a
 # redundant queue-item lookup in on_print_start so this dict isn't load-bearing
 # for the queue path. Cleared on print completion or TTL eviction.
-_print_plate_ids: dict[int, int] = {}
+_print_plate_ids: dict[tuple[int, int], int] = {}
 
 # Track progress milestones for notifications: {printer_id: last_milestone_notified}
 # Milestones are 25, 50, 75. Value of 0 means no milestone notified yet for current print.
@@ -938,9 +940,19 @@ async def running_print_archive(db, printer_id: int, state: PrinterState, *, pri
     never a deleted one.
     """
     from backend.app.models.archive import PrintArchive
+    from backend.app.services.print_log import open_run_on_printer
 
     subtask_id = str(getattr(state, "subtask_id", "") or "").strip()
     if subtask_id not in ("", "0"):
+        # The run open on the printer for this job: the archive row is shared
+        # by every plate of it, its printer and job id the latest start's.
+        run = await open_run_on_printer(db, printer_id, subtask_id=subtask_id)
+        if run is not None and run.archive_id is not None:
+            archive = await db.scalar(
+                select(PrintArchive).where(PrintArchive.id == run.archive_id, PrintArchive.deleted_at.is_(None))
+            )
+            if archive is not None:
+                return archive
         query = select(PrintArchive).where(
             PrintArchive.printer_id == printer_id,
             PrintArchive.subtask_id == subtask_id,
@@ -986,17 +998,23 @@ def _bind_active_print(
             _active_prints[(printer_id, name)] = archive_id
 
 
-async def _discard_open_runs_of(printer_id: int) -> None:
-    """Drop the printer's open runs when its print ended with no archive to
-    end them on. Its own session; never in the way of the completion."""
+async def _archive_of_open_run(printer_id: int, subtask_id: str | None = None) -> int | None:
+    """The archive of the run open on the printer, if it is still there.
+    With ``subtask_id``, only a run of that job."""
     try:
-        from backend.app.services.print_log import discard_open_runs
+        from backend.app.models.archive import PrintArchive
+        from backend.app.services.print_log import open_run_on_printer
 
         async with async_session() as db:
-            await discard_open_runs(db, printer_id)
-            await db.commit()
+            run = await open_run_on_printer(db, printer_id, subtask_id=subtask_id)
+            if run is None or run.archive_id is None:
+                return None
+            return await db.scalar(
+                select(PrintArchive.id).where(PrintArchive.id == run.archive_id, PrintArchive.deleted_at.is_(None))
+            )
     except Exception as e:
-        logging.getLogger(__name__).warning("[RUN] Could not drop the open runs of printer %s: %s", printer_id, e)
+        logging.getLogger(__name__).warning("[RUN] Could not read the open run of printer %s: %s", printer_id, e)
+        return None
 
 
 async def _open_run_for(archive_id: int, printer_id: int) -> None:
@@ -1015,7 +1033,11 @@ async def _open_run_for(archive_id: int, printer_id: int) -> None:
                 return
             printer_name = await db.scalar(select(Printer.name).where(Printer.id == printer_id))
             await open_run(
-                db, archive, printer_id=printer_id, printer_name=printer_name, plate_id=_print_plate_ids.get(archive_id)
+                db,
+                archive,
+                printer_id=printer_id,
+                printer_name=printer_name,
+                plate_id=_print_plate_ids.get((printer_id, archive_id)),
             )
             await db.commit()
     except Exception as e:
@@ -1097,17 +1119,25 @@ async def _is_bambuddy_authorized_print(printer_id: int, state: PrinterState, db
             return None
         archive = await _printing_archive_without_job_id(db, printer_id, reported, dispatched_only=True)
     else:
-        result = await db.execute(
-            select(PrintArchive)
-            .where(
-                PrintArchive.printer_id == printer_id,
-                PrintArchive.status == "printing",
-                PrintArchive.subtask_id == subtask_id,
+        from backend.app.services.print_log import open_run_on_printer
+
+        # This job's run open on the printer: the archive is shared by every
+        # plate of it, and its status, printer and job id are the latest
+        # start's, which may be another printer's.
+        run = await open_run_on_printer(db, printer_id, subtask_id=subtask_id)
+        archive = await db.get(PrintArchive, run.archive_id) if run is not None and run.archive_id else None
+        if archive is None:
+            result = await db.execute(
+                select(PrintArchive)
+                .where(
+                    PrintArchive.printer_id == printer_id,
+                    PrintArchive.status == "printing",
+                    PrintArchive.subtask_id == subtask_id,
+                )
+                .order_by(PrintArchive.created_at.desc())
+                .limit(1)
             )
-            .order_by(PrintArchive.created_at.desc())
-            .limit(1)
-        )
-        archive = result.scalar_one_or_none()
+            archive = result.scalar_one_or_none()
 
     # An archive row on its own proves nothing: `on_print_start` archives every
     # print it observes, including ones started from Bambu Studio or Handy, and
@@ -1292,9 +1322,9 @@ async def forget_printer(printer_id: int) -> None:
             archive_ids.add(tracked.pop(key))
     for archive_id in archive_ids:
         _owned_print_archive_ids.discard(archive_id)
-        _print_ams_mappings.pop(archive_id, None)
-        _print_cost_center_ids.pop(archive_id, None)
-        _print_plate_ids.pop(archive_id, None)
+    for registered in (_print_ams_mappings, _print_cost_center_ids, _print_plate_ids):
+        for key in [key for key in registered if key[0] == printer_id]:
+            del registered[key]
     for tracked in (_expected_print_creators, _expected_print_registered_at):
         for key in [key for key in tracked if key[0] == printer_id]:
             del tracked[key]
@@ -1379,19 +1409,20 @@ def register_expected_print(
     # the printed plate (#1697). They describe this dispatch: one that has none
     # drops what an earlier dispatch of the archive left (sent, never started),
     # unless a plate of the archive is printing now and still needs them.
-    archive_printing = archive_id in set(_active_prints.values())
+    dispatch = (printer_id, archive_id)
+    archive_printing = _printing_here(printer_id, archive_id)
     if ams_mapping is not None:
-        _print_ams_mappings[archive_id] = ams_mapping
+        _print_ams_mappings[dispatch] = ams_mapping
     elif not archive_printing:
-        _print_ams_mappings.pop(archive_id, None)
+        _print_ams_mappings.pop(dispatch, None)
     if cost_center_id is not None:
-        _print_cost_center_ids[archive_id] = cost_center_id
+        _print_cost_center_ids[dispatch] = cost_center_id
     elif not archive_printing:
-        _print_cost_center_ids.pop(archive_id, None)
+        _print_cost_center_ids.pop(dispatch, None)
     if plate_id is not None:
-        _print_plate_ids[archive_id] = plate_id
+        _print_plate_ids[dispatch] = plate_id
     elif not archive_printing:
-        _print_plate_ids.pop(archive_id, None)
+        _print_plate_ids.pop(dispatch, None)
     # Store created_by_id so the user start email can be sent even when the archive
     # itself has no created_by_id (e.g. library-file-based queue prints)
     if created_by_id is not None:
@@ -1428,8 +1459,8 @@ def unregister_expected_print(printer_id: int, filename: str, archive_id: int) -
 
     Mirrors the sweep's rules, including the one that is easy to get wrong:
     ``_print_ams_mappings`` / ``_print_plate_ids`` / ``_print_cost_center_ids``
-    are keyed by archive, not by file, so they may only be dropped once no
-    live key still points at that archive.
+    are keyed by printer and archive, not by file, so they may only be dropped
+    once no live key of the printer still points at that archive.
     """
     keys = [(printer_id, filename)]
     if filename.endswith(".3mf"):
@@ -1444,12 +1475,10 @@ def unregister_expected_print(printer_id: int, filename: str, archive_id: int) -
         _expected_print_creators.pop(key, None)
         _expected_print_registered_at.pop(key, None)
 
-    # Still needed by another expected print of the archive, or a plate of it
-    # that is printing, as in the sweep.
-    if archive_id not in set(_expected_prints.values()) | set(_active_prints.values()):
-        _print_ams_mappings.pop(archive_id, None)
-        _print_cost_center_ids.pop(archive_id, None)
-        _print_plate_ids.pop(archive_id, None)
+    # Still needed by another expected print of the archive on the printer,
+    # or a plate of it printing there, as in the sweep.
+    if not _expected_or_printing_here(printer_id, archive_id):
+        _drop_dispatch(printer_id, archive_id)
 
     if removed:
         logging.getLogger(__name__).info(
@@ -1492,15 +1521,35 @@ def _compute_run_filament_grams(
     return None
 
 
-def _get_start_ams_mapping(data: dict, archive_id: int | None) -> list[int] | None:
+def _printing_here(printer_id: int, archive_id: int) -> bool:
+    """Whether a plate of the archive is printing on the printer."""
+    return any(key[0] == printer_id and bound == archive_id for key, bound in _active_prints.items())
+
+
+def _expected_or_printing_here(printer_id: int, archive_id: int) -> bool:
+    """Whether a print of the archive is expected or printing on the printer."""
+    return _printing_here(printer_id, archive_id) or any(
+        key[0] == printer_id and expected == archive_id for key, expected in _expected_prints.items()
+    )
+
+
+def _drop_dispatch(printer_id: int, archive_id: int) -> None:
+    """Forget what the dispatch of the archive to the printer registered."""
+    dispatch = (printer_id, archive_id)
+    _print_ams_mappings.pop(dispatch, None)
+    _print_cost_center_ids.pop(dispatch, None)
+    _print_plate_ids.pop(dispatch, None)
+
+
+def _get_start_ams_mapping(data: dict, printer_id: int, archive_id: int | None) -> list[int] | None:
     """Resolve AMS mapping for print start without consuming stored queue/reprint state."""
     stored_ams_mapping = data.get("ams_mapping")
     if not stored_ams_mapping and archive_id:
-        stored_ams_mapping = _print_ams_mappings.get(archive_id)
+        stored_ams_mapping = _print_ams_mappings.get((printer_id, archive_id))
     return stored_ams_mapping
 
 
-def _get_start_plate_id(archive_id: int | None) -> int | None:
+def _get_start_plate_id(printer_id: int, archive_id: int | None) -> int | None:
     """Resolve plate_id for print start without consuming stored direct-Print state.
 
     Direct-Print of a single plate from a multi-plate 3MF registers plate_id in
@@ -1510,7 +1559,7 @@ def _get_start_plate_id(archive_id: int | None) -> int | None:
     """
     if archive_id is None:
         return None
-    return _print_plate_ids.get(archive_id)
+    return _print_plate_ids.get((printer_id, archive_id))
 
 
 def _partial_progress_scale(progress: int | float | None) -> float:
@@ -4153,7 +4202,7 @@ async def _recover_fallback_archive_locked(
                 recovered.file_path,
                 db,
                 printer_manager,
-                plate_id=_get_start_plate_id(recovered.id) or recovered.plate_id,
+                plate_id=_get_start_plate_id(printer_id, recovered.id) or recovered.plate_id,
                 may_start=not price or (recovered.status == "printing" and not is_completing(printer_id)),
             )
         except Exception:
@@ -4172,8 +4221,8 @@ async def _recover_fallback_archive_locked(
                 printer_id,
                 recovered.id,
                 printer_manager,
-                ams_mapping=_get_start_ams_mapping(print_data, recovered.id),
-                plate_id=_get_start_plate_id(recovered.id) or recovered.plate_id,
+                ams_mapping=_get_start_ams_mapping(print_data, printer_id, recovered.id),
+                plate_id=_get_start_plate_id(printer_id, recovered.id) or recovered.plate_id,
                 session_factory=async_session,
             )
         # `archive_updated`, not `archive_created` — the row was already on the
@@ -5120,7 +5169,7 @@ async def on_print_start(printer_id: int, data: dict):
                 archive.timelapse_baseline = None
                 stale_timelapse_relpath = archive.timelapse_path
                 stale_timelapse_plate_id = archive.timelapse_plate_id
-                starting_plate_id = _print_plate_ids.get(expected_archive_id)
+                starting_plate_id = _print_plate_ids.get((printer_id, expected_archive_id))
                 if stale_timelapse_relpath:
                     archive.timelapse_path = None
                     archive.timelapse_plate_id = None
@@ -5248,8 +5297,8 @@ async def on_print_start(printer_id: int, data: dict):
                 # Inject ams_mapping into usage tracker session — the session was created
                 # before expected-print promotion, so it may have ams_mapping=None when
                 # the MQTT request topic subscription failed (common on P1S/A1).
-                _stored_map = _print_ams_mappings.get(expected_archive_id)
-                _stored_plate_id = _print_plate_ids.get(expected_archive_id)
+                _stored_map = _print_ams_mappings.get((printer_id, expected_archive_id))
+                _stored_plate_id = _print_plate_ids.get((printer_id, expected_archive_id))
                 if _stored_map or _stored_plate_id is not None:
                     try:
                         from backend.app.services.usage_tracker import _active_sessions
@@ -5301,8 +5350,8 @@ async def on_print_start(printer_id: int, data: dict):
                         archive.file_path,
                         db,
                         printer_manager,
-                        ams_mapping=_get_start_ams_mapping(data, archive.id),
-                        plate_id=_get_start_plate_id(archive.id),
+                        ams_mapping=_get_start_ams_mapping(data, printer_id, archive.id),
+                        plate_id=_get_start_plate_id(printer_id, archive.id),
                     )
                 except Exception as e:
                     logger.warning("[SPOOLMAN] Failed to store tracking data: %s", e)
@@ -5312,8 +5361,8 @@ async def on_print_start(printer_id: int, data: dict):
                     printer_id,
                     archive.id,
                     printer_manager,
-                    ams_mapping=_get_start_ams_mapping(data, archive.id),
-                    plate_id=_get_start_plate_id(archive.id),
+                    ams_mapping=_get_start_ams_mapping(data, printer_id, archive.id),
+                    plate_id=_get_start_plate_id(printer_id, archive.id),
                     session_factory=async_session,
                 )
 
@@ -5345,13 +5394,28 @@ async def on_print_start(printer_id: int, data: dict):
         from backend.app.models.archive import PrintArchive
 
         existing_archive: PrintArchive | None = None
+        resumed_by_run = False
+
+        # Best match: this job's run, open on the printer since the print
+        # started. The archive row is shared by every plate of it, and its
+        # printer, job id and status are the latest start's, which may be
+        # another printer's.
+        if subtask_id:
+            from backend.app.services.print_log import open_run_on_printer
+
+            run = await open_run_on_printer(db, printer_id, subtask_id=subtask_id)
+            if run is not None and run.archive_id is not None:
+                existing_archive = await db.scalar(
+                    select(PrintArchive).where(PrintArchive.id == run.archive_id, PrintArchive.deleted_at.is_(None))
+                )
+                resumed_by_run = existing_archive is not None
 
         # Preferred match: subtask_id equality. MQTT reports the same subtask_id
         # across a backend restart for the same print, so this is the most
         # reliable way to reattach. Only a row still printing: a cancelled one
         # has been through completion (usage, history, notifications) already,
         # and reopening it would count the print twice.
-        if subtask_id:
+        if subtask_id and existing_archive is None:
             by_id = await db.execute(
                 select(PrintArchive)
                 .where(PrintArchive.printer_id == printer_id)
@@ -5390,7 +5454,7 @@ async def on_print_start(printer_id: int, data: dict):
         if existing_archive:
             # subtask_id match → always resume, regardless of age. Same print,
             # just a backend restart.
-            subtask_match = bool(subtask_id and existing_archive.subtask_id == subtask_id)
+            subtask_match = resumed_by_run or bool(subtask_id and existing_archive.subtask_id == subtask_id)
 
             if subtask_match:
                 logger.info("Resuming archive %s on subtask_id match (%s)", existing_archive.id, subtask_id)
@@ -6101,7 +6165,9 @@ async def on_print_start(printer_id: int, data: dict):
                 # state at print start was sitting right there in `data`.
                 # The slicer's ams_mapping (when present) narrows the result
                 # to slots actually used by the print (#1533).
-                mqtt_filament_meta = _extract_filament_data_from_mqtt(data, _get_start_ams_mapping(data, None))
+                mqtt_filament_meta = _extract_filament_data_from_mqtt(
+                    data, _get_start_ams_mapping(data, printer_id, None)
+                )
 
                 # Create minimal archive entry
                 fallback_archive = PrintArchive(
@@ -6184,8 +6250,8 @@ async def on_print_start(printer_id: int, data: dict):
                         fallback_archive.file_path,
                         db,
                         printer_manager,
-                        ams_mapping=_get_start_ams_mapping(data, fallback_archive.id),
-                        plate_id=_get_start_plate_id(fallback_archive.id),
+                        ams_mapping=_get_start_ams_mapping(data, printer_id, fallback_archive.id),
+                        plate_id=_get_start_plate_id(printer_id, fallback_archive.id),
                     )
                 except Exception as e:
                     logger.debug("[SPOOLMAN] Could not store tracking for fallback archive: %s", e)
@@ -6383,8 +6449,8 @@ async def on_print_start(printer_id: int, data: dict):
                         archive.file_path,
                         db,
                         printer_manager,
-                        ams_mapping=_get_start_ams_mapping(data, archive.id),
-                        plate_id=_get_start_plate_id(archive.id),
+                        ams_mapping=_get_start_ams_mapping(data, printer_id, archive_id),
+                        plate_id=_get_start_plate_id(printer_id, archive_id),
                     )
                 except Exception as e:
                     logger.warning("[SPOOLMAN] Failed to store tracking data: %s", e)
@@ -6394,8 +6460,8 @@ async def on_print_start(printer_id: int, data: dict):
                     printer_id,
                     archive.id,
                     printer_manager,
-                    ams_mapping=_get_start_ams_mapping(data, archive.id),
-                    plate_id=_get_start_plate_id(archive.id),
+                    ams_mapping=_get_start_ams_mapping(data, printer_id, archive_id),
+                    plate_id=_get_start_plate_id(printer_id, archive_id),
                     session_factory=async_session,
                 )
 
@@ -7911,7 +7977,7 @@ def _bound_print(printer_id: int, data: dict) -> tuple[int | None, int | None]:
         archive_id = next((_active_prints[key] for key in keys if key in _active_prints), None)
         if archive_id is None:
             return None, None
-        return archive_id, _print_plate_ids.get(archive_id)
+        return archive_id, _print_plate_ids.get((printer_id, archive_id))
     except Exception:
         logging.getLogger(__name__).debug("Could not read the print binding for printer %s", printer_id, exc_info=True)
         return None, None
@@ -8804,8 +8870,9 @@ async def _close_out_print(printer_id: int, data: dict):
         if archive_id:
             _owned_print_archive_ids.discard(archive_id)
             logger.info("Found archive %s with key %s", archive_id, key)
-            # Also clean up any other keys pointing to this archive
-            keys_to_remove = [k for k, v in _active_prints.items() if v == archive_id]
+            # Also clean up the printer's other keys pointing to this archive;
+            # another printer's are a plate of it still printing there.
+            keys_to_remove = [k for k, v in _active_prints.items() if v == archive_id and k[0] == printer_id]
             for k in keys_to_remove:
                 _active_prints.pop(k, None)
             break
@@ -8813,6 +8880,16 @@ async def _close_out_print(printer_id: int, data: dict):
     # Only this one may give the finish-photo plate restore a height (#3240):
     # the search matches names by substring.
     bound_archive_id = archive_id
+
+    ending_job = str(data.get("subtask_id") or "").strip()
+    if not archive_id and ending_job not in ("", "0"):
+        # Not bound (a restart since the start): this job's run, open on the
+        # printer. Only by its job id: a run open there can be of the print
+        # running now, while the end is of an earlier one closed late (the
+        # restart's reconcile of a missed end).
+        archive_id = await _archive_of_open_run(printer_id, subtask_id=ending_job)
+        if archive_id:
+            logger.info("Found archive %s by the run of job %s open on printer %s", archive_id, ending_job, printer_id)
 
     if not archive_id:
         # Try to find by filename or subtask_name if not tracked (for prints started before app)
@@ -9068,7 +9145,9 @@ async def _close_out_print(printer_id: int, data: dict):
                     billing_planned_grams, billing_base_cost = _plate_scoped_run_estimate(
                         billing_archive,
                         billing_path,
-                        billing_plate_id if billing_plate_id is not None else _get_start_plate_id(archive_id),
+                        billing_plate_id
+                        if billing_plate_id is not None
+                        else _get_start_plate_id(printer_id, archive_id),
                     )
         except Exception as e:
             logger.warning("[FINANCE] Failed to capture planned usage for archive %s: %s", archive_id, e)
@@ -9081,7 +9160,7 @@ async def _close_out_print(printer_id: int, data: dict):
     # Fallback to _print_ams_mappings for queue/reprint (set before print starts).
     # Drained either way, like the plate below: left over, it would be read by
     # the archive's next run, dispatched without a mapping.
-    registered_ams_mapping = _print_ams_mappings.pop(archive_id, None) if archive_id else None
+    registered_ams_mapping = _print_ams_mappings.pop((printer_id, archive_id), None) if archive_id else None
     if not stored_ams_mapping:
         stored_ams_mapping = registered_ams_mapping
 
@@ -9093,7 +9172,7 @@ async def _close_out_print(printer_id: int, data: dict):
     # down to the single plate that was actually printed (#1785).
     notify_plate_id: int | None = None
     if archive_id:
-        notify_plate_id = _print_plate_ids.pop(archive_id, None)
+        notify_plate_id = _print_plate_ids.pop((printer_id, archive_id), None)
 
     # The start estimate must not outlive the real cost written below (COST-4).
     if archive_id:
@@ -9284,7 +9363,6 @@ async def _close_out_print(printer_id: int, data: dict):
                 logger.warning("[NOTIFY-BG] Failed to send notification without archive: %s", e, exc_info=True)
 
         spawn_background_task(_notify_no_archive(), name="notify-no-archive")
-        await _discard_open_runs_of(printer_id)
         return
 
     log_timing("Archive lookup")
@@ -9385,7 +9463,7 @@ async def _close_out_print(printer_id: int, data: dict):
                     usage_results,
                 )
                 filament_usage = (actual_run_grams, billing_planned_grams) if run_status != "completed" else None
-                in_memory_cost_center_id = _print_cost_center_ids.pop(archive_id, None)
+                in_memory_cost_center_id = _print_cost_center_ids.pop((printer_id, archive_id), None)
                 charged = await apply_print_charge_for_archive(
                     db,
                     archive_id,
@@ -11221,11 +11299,11 @@ def _evict_stale_expected_prints() -> None:
     if not stale_keys:
         return
 
-    evicted_archive_ids: set[int] = set()
+    evicted: set[tuple[int, int]] = set()
     for key in stale_keys:
         archive_id = _expected_prints.pop(key, None)
         if archive_id is not None:
-            evicted_archive_ids.add(archive_id)
+            evicted.add((key[0], archive_id))
         _expected_print_creators.pop(key, None)
         _expected_print_registered_at.pop(key, None)
 
@@ -11236,12 +11314,9 @@ def _evict_stale_expected_prints() -> None:
     # outlives it; without the printing check its eviction two hours after
     # dispatch threw away a running print's plate, AMS mapping and cost
     # centre, which completion still reads (#3275).
-    live_archive_ids = set(_expected_prints.values()) | set(_active_prints.values())
-    for archive_id in evicted_archive_ids:
-        if archive_id not in live_archive_ids:
-            _print_ams_mappings.pop(archive_id, None)
-            _print_cost_center_ids.pop(archive_id, None)
-            _print_plate_ids.pop(archive_id, None)
+    for printer_id, archive_id in evicted:
+        if not _expected_or_printing_here(printer_id, archive_id):
+            _drop_dispatch(printer_id, archive_id)
 
     logging.getLogger(__name__).info(
         "Evicted %d stale expected-print entries (TTL=%ds)", len(stale_keys), _EXPECTED_PRINT_TTL_SECONDS

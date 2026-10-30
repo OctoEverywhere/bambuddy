@@ -666,7 +666,7 @@ class TestPlateRestoreWiring:
 
         monkeypatch.setattr("backend.app.api.routes.settings.get_setting", _yielding_get_setting)
         main_module._active_prints[(patched_env.id, "job.3mf")] = 5
-        main_module._print_plate_ids[5] = 3
+        main_module._print_plate_ids[(patched_env.id, 5)] = 3
 
         async def _on_print_complete_pops():
             main_module._active_prints.clear()
@@ -984,7 +984,7 @@ class TestBoundPrint:
     def test_finds_the_archive_under_the_keys_on_print_complete_tries(self):
         main_module._active_prints[(7, "Cube v2.gcode.3mf")] = 169
         main_module._active_prints[(7, "Cube_v2.3mf")] = 169
-        main_module._print_plate_ids[169] = 12
+        main_module._print_plate_ids[(7, 169)] = 12
 
         bound = main_module._bound_print(7, {"filename": "Cube_v2.3mf", "subtask_name": "Cube_v2"})
 
@@ -993,12 +993,12 @@ class TestBoundPrint:
     def test_reads_without_consuming(self):
         """on_print_complete still has to find the binding after we looked."""
         main_module._active_prints[(7, "job.3mf")] = 5
-        main_module._print_plate_ids[5] = 2
+        main_module._print_plate_ids[(7, 5)] = 2
 
         main_module._bound_print(7, {"filename": "job.3mf", "subtask_name": "job"})
 
         assert main_module._active_prints == {(7, "job.3mf"): 5}
-        assert main_module._print_plate_ids == {5: 2}
+        assert main_module._print_plate_ids == {(7, 5): 2}
 
     def test_unbound_print_and_other_printers(self):
         main_module._active_prints[(8, "job.3mf")] = 5

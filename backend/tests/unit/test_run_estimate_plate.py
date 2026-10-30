@@ -89,7 +89,7 @@ async def test_a_direct_print_is_estimated_for_its_plate(test_engine, db_session
         printer.id, filename="multi.gcode.3mf", plate_id=1, status="printing", with_run=False
     )
     main_module._active_prints[(printer.id, "multi.gcode.3mf")] = archive.id
-    main_module._print_plate_ids[archive.id] = 3
+    main_module._print_plate_ids[(printer.id, archive.id)] = 3
 
     assert await _complete(test_engine, printer.id) == [3, 3]
 
@@ -117,7 +117,7 @@ async def test_a_direct_print_logs_its_plate(test_engine, db_session, printer_fa
         printer.id, filename="multi.gcode.3mf", plate_id=1, status="printing", with_run=False
     )
     main_module._active_prints[(printer.id, "multi.gcode.3mf")] = archive.id
-    main_module._print_plate_ids[archive.id] = 3
+    main_module._print_plate_ids[(printer.id, archive.id)] = 3
 
     logged: list = []
     await _complete(test_engine, printer.id, logged)

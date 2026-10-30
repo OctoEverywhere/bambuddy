@@ -37,7 +37,7 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 FILE = f"{SUBTASK}.gcode.3mf"
 
 
-async def _complete(test_engine, printer_id: int, status: str, name: str):
+async def _complete(test_engine, printer_id: int, status: str, name: str, extra: dict | None = None):
     """``on_print_complete`` with its background work run one task at a time.
 
     The SQLite test database is one shared connection, so tasks writing at
@@ -61,7 +61,7 @@ async def _complete(test_engine, printer_id: int, status: str, name: str):
         return spawn_background_task(coro, name=name, **kwargs)
 
     with patch("backend.app.main.spawn_background_task", side_effect=spawn):
-        return await _complete_concurrently(test_engine, printer_id, status, name=name)
+        return await _complete_concurrently(test_engine, printer_id, status, name=name, extra=extra)
 
 
 @pytest.fixture(autouse=True)
@@ -465,36 +465,36 @@ async def test_a_downloaded_print_opens_its_run(test_engine, db_session, printer
     assert [r.status for r in await _all_runs(db_session, archives[0].id)] == ["printing"]
 
 
-async def test_two_plates_on_two_printers_at_once_leave_no_open_run(test_engine, db_session, farm, printer_factory):
-    """The second start moves the archive's start to its own; the first
-    printer's end still fills its own run, with its own start.
-
-    The second printer's end finds the archive no longer printing and logs
-    nothing, as before runs were opened at the start: the archive holds one
-    print's state. Its open run goes with that end. Moving the print's state
-    onto the run (P1b) is what gives it its own record."""
+async def test_two_plates_on_two_printers_at_once_each_end_their_own_run(
+    test_engine, db_session, farm, printer_factory
+):
+    """The second start moves the archive's start, printer and job id to its
+    own. Each printer's end still finds its print, fills its own run with its
+    own start and plate, and leaves nothing open."""
     other = (await printer_factory(name="Q")).id
-    register_expected_print(farm.printer, FILE, farm.archive, plate_id=1)
+    register_expected_print(farm.printer, FILE, farm.archive, plate_id=1, cost_center_id=farm.center)
     await _drive_print_start(test_engine, SimpleNamespace(id=farm.printer), download_ok=False)
     [first] = await _all_runs(db_session, farm.archive)
     first_start = first.started_at
     await asyncio.sleep(1.1)  # the second start is a later second
-    register_expected_print(other, FILE, farm.archive, plate_id=2)
+    register_expected_print(other, FILE, farm.archive, plate_id=2, cost_center_id=farm.center)
     await _drive_print_start(test_engine, SimpleNamespace(id=other), download_ok=False)
 
     await _complete(test_engine, farm.printer, "completed", name=SUBTASK)
+    assert main_module._print_cost_center_ids == {(other, farm.archive): farm.center}
+    # The other printer's print is still bound, for its own end.
+    assert main_module._active_prints.get((other, FILE)) == farm.archive
+    assert main_module._print_plate_ids == {(other, farm.archive): 2}, "the first end drains only its own"
     await _complete(test_engine, other, "completed", name=SUBTASK)
+    assert main_module._print_plate_ids == {}
 
     runs = await _all_runs(db_session, farm.archive)
-    assert [(r.id, r.printer_id, r.status, r.started_at) for r in runs] == [
-        (first.id, farm.printer, "completed", first_start)
+    assert [(r.printer_id, r.status, r.plate_id) for r in runs] == [
+        (farm.printer, "completed", 1),
+        (other, "completed", 2),
     ]
-    open_left = (
-        await db_session.scalars(
-            select(PrintLogEntry).where(PrintLogEntry.status == "printing").execution_options(include_open_runs=True)
-        )
-    ).all()
-    assert open_left == []
+    assert runs[0].id == first.id and runs[0].started_at == first_start
+    assert runs[1].started_at > first_start
 
 
 async def test_a_run_is_dated_by_its_end(test_engine, db_session, farm):
@@ -604,3 +604,149 @@ async def test_a_reprint_after_an_unseen_end_opens_a_run_of_its_own(test_engine,
     archive = await db_session.get(PrintArchive, farm.archive)
     assert run.started_at != datetime(2026, 10, 1, 8)
     assert (run.started_at, run.plate_id) == (archive.started_at, 2)
+
+
+async def _two_printers_printing(test_engine, db_session, farm, printer_factory) -> int:
+    """Plate 1 on the farm's printer, then plate 2 of the archive on another,
+    both running. Returns the other printer's id."""
+    other = (await printer_factory(name="Q")).id
+    register_expected_print(farm.printer, FILE, farm.archive, plate_id=1)
+    await _drive_print_start(test_engine, SimpleNamespace(id=farm.printer), download_ok=False)
+    await asyncio.sleep(1.1)
+    register_expected_print(other, FILE, farm.archive, plate_id=2)
+    await _drive_print_start(test_engine, SimpleNamespace(id=other), download_ok=False)
+    return other
+
+
+async def test_after_a_restart_each_printers_end_finds_its_run(test_engine, db_session, farm, printer_factory):
+    """A restart forgets which print runs where; the run open on the printer
+    still says, though the archive now names the other printer."""
+    from sqlalchemy import update
+
+    other = await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    await db_session.execute(
+        update(PrintLogEntry)
+        .where(PrintLogEntry.printer_id == farm.printer)
+        .values(subtask_id="job-p")
+        .execution_options(include_open_runs=True)
+    )
+    await db_session.commit()
+    main_module._active_prints.clear()  # the restart
+    archive = await db_session.get(PrintArchive, farm.archive)
+    assert archive.printer_id == other
+
+    await _complete(test_engine, farm.printer, "failed", name=SUBTASK, extra={"subtask_id": "job-p"})
+
+    runs = {r.printer_id: r.status for r in await _all_runs(db_session, farm.archive)}
+    assert runs == {farm.printer: "failed", other: "printing"}
+
+
+async def test_the_running_print_on_each_printer_is_its_own(test_engine, db_session, farm, printer_factory):
+    """The skip-objects, plate label and pause lookups ask which archive runs
+    on a printer, by its job id; the archive row has the latest start's."""
+    from unittest.mock import MagicMock
+
+    from sqlalchemy import update
+
+    from backend.app.main import running_print_archive
+
+    other = await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    await db_session.execute(
+        update(PrintLogEntry)
+        .where(PrintLogEntry.printer_id == farm.printer)
+        .values(subtask_id="job-p")
+        .execution_options(include_open_runs=True)
+    )
+    archive = await db_session.get(PrintArchive, farm.archive)
+    archive.subtask_id = "job-q"
+    await db_session.commit()
+    main_module._active_prints.clear()
+
+    found = await running_print_archive(
+        db_session, farm.printer, MagicMock(subtask_id="job-p"), printing_only=True, by_name=False
+    )
+
+    assert found is not None and found.id == farm.archive
+    assert archive.printer_id == other
+
+
+async def test_the_kill_switch_knows_its_own_print_on_each_printer(test_engine, db_session, farm, printer_factory):
+    """Bambuddy's print on the first printer is authorized by its own run,
+    though the archive's job id and printer are the second start's."""
+    from unittest.mock import MagicMock
+
+    from sqlalchemy import update
+
+    from backend.app.main import _is_bambuddy_authorized_print
+
+    await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    await db_session.execute(
+        update(PrintLogEntry)
+        .where(PrintLogEntry.printer_id == farm.printer)
+        .values(subtask_id="job-p")
+        .execution_options(include_open_runs=True)
+    )
+    archive = await db_session.get(PrintArchive, farm.archive)
+    archive.subtask_id = "job-q"
+    await db_session.commit()
+    main_module._active_prints.clear()
+    main_module._owned_print_archive_ids.clear()
+
+    state = MagicMock(subtask_id="job-p", subtask_name=SUBTASK, gcode_file="")
+    assert await _is_bambuddy_authorized_print(farm.printer, state, db_session) is True
+
+
+async def test_a_restart_resumes_each_printers_print_on_its_archive(test_engine, db_session, farm, printer_factory):
+    """Bambuddy comes back while both plates print: the first printer's print
+    is resumed on the archive by its run, not archived anew, though the
+    archive names the other printer and its job."""
+    from sqlalchemy import update
+
+    other = await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    await db_session.execute(
+        update(PrintLogEntry)
+        .where(PrintLogEntry.printer_id == farm.printer)
+        .values(subtask_id="job-p")
+        .execution_options(include_open_runs=True)
+    )
+    archive = await db_session.get(PrintArchive, farm.archive)
+    archive.subtask_id = "job-q"
+    await db_session.commit()
+    main_module._active_prints.clear()  # the restart
+
+    await _drive_print_start(
+        test_engine,
+        SimpleNamespace(id=farm.printer),
+        download_ok=False,
+        state_fields={"progress": 40.0},
+        raw_data={"subtask_id": "job-p"},
+    )
+
+    assert await db_session.scalar(select(func.count()).select_from(PrintArchive)) == 1, "resumed, not archived anew"
+    assert main_module._active_prints.get((farm.printer, FILE)) == farm.archive
+    runs = {r.printer_id: r.status for r in await _all_runs(db_session, farm.archive)}
+    assert runs == {farm.printer: "printing", other: "printing"}
+
+
+@pytest.mark.parametrize("jobs", [("job-z", "job-y"), ("0", "0")], ids=["other-job", "no-job-ids"])
+async def test_a_late_end_of_an_earlier_job_leaves_the_running_print_alone(test_engine, db_session, farm, jobs):
+    """The restart's reconcile closes a print that ended unseen, while the
+    printer runs another one now: that one's open run is not the end's. A
+    print started outside the cloud reports job "0", which tells nothing."""
+    running_job, ending_job = jobs
+    from sqlalchemy import update
+
+    await _start_queued(test_engine, db_session, farm, plate=1, run_id="run-z")
+    await db_session.execute(
+        update(PrintLogEntry).values(subtask_id=running_job).execution_options(include_open_runs=True)
+    )
+    await db_session.commit()
+    main_module._active_prints.clear()  # the restart
+
+    await _complete(
+        test_engine, farm.printer, "aborted", name="Other_part", extra={"subtask_id": ending_job, "_reconciled": True}
+    )
+
+    assert [(r.status, r.subtask_id) for r in await _all_runs(db_session, farm.archive)] == [("printing", running_job)]
+    archive = await db_session.get(PrintArchive, farm.archive)
+    assert archive.status == "printing"
