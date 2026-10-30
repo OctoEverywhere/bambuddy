@@ -986,6 +986,42 @@ def _bind_active_print(
             _active_prints[(printer_id, name)] = archive_id
 
 
+async def _discard_open_runs_of(printer_id: int) -> None:
+    """Drop the printer's open runs when its print ended with no archive to
+    end them on. Its own session; never in the way of the completion."""
+    try:
+        from backend.app.services.print_log import discard_open_runs
+
+        async with async_session() as db:
+            await discard_open_runs(db, printer_id)
+            await db.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning("[RUN] Could not drop the open runs of printer %s: %s", printer_id, e)
+
+
+async def _open_run_for(archive_id: int, printer_id: int) -> None:
+    """Write the run of the print that just started on the archive (archive
+    redesign). In a session of its own and never in the way of the print
+    start: until its readers move over, the archive still carries the print.
+    The archive's start must be committed before."""
+    try:
+        from backend.app.models.archive import PrintArchive
+        from backend.app.models.printer import Printer
+        from backend.app.services.print_log import open_run
+
+        async with async_session() as db:
+            archive = await db.get(PrintArchive, archive_id)
+            if archive is None:
+                return
+            printer_name = await db.scalar(select(Printer.name).where(Printer.id == printer_id))
+            await open_run(
+                db, archive, printer_id=printer_id, printer_name=printer_name, plate_id=_print_plate_ids.get(archive_id)
+            )
+            await db.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning("[RUN] Could not open the run of archive %s: %s", archive_id, e)
+
+
 def _mark_owned_if_dispatched(archive) -> None:
     """Remember a running print's archive as Bambuddy's when it carries a
     dispatch marker Bambuddy writes itself: ``billing_run_id`` (minted per
@@ -1196,6 +1232,12 @@ async def _record_energy_start(archive, printer_id: int, db, *, context: str = "
         except Exception as e:
             _logger.warning("[ENERGY] Could not read the electricity price for archive %s: %s", archive.id, e)
             archive.energy_start_price = None
+        try:
+            from backend.app.services.print_log import mirror_energy_start
+
+            await mirror_energy_start(db, archive, printer_id=printer_id)
+        except Exception as e:
+            _logger.warning("[RUN] Energy start not copied onto the run of archive %s: %s", archive.id, e)
         await db.commit()
         _logger.info(
             "[ENERGY] Recorded starting energy%s for archive %s from plug '%s': %s kWh",
@@ -5195,6 +5237,7 @@ async def on_print_start(printer_id: int, data: dict):
 
                 # Track as active print
                 _bind_active_print(printer_id, archive.id, archive.filename, filename, subtask_name)
+                await _open_run_for(archive.id, printer_id)
 
                 # Start timelapse session if external camera is enabled (#1353).
                 # Queue / VP-dispatched prints land here in the expected-archive
@@ -5352,6 +5395,7 @@ async def on_print_start(printer_id: int, data: dict):
             if subtask_match:
                 logger.info("Resuming archive %s on subtask_id match (%s)", existing_archive.id, subtask_id)
                 _bind_active_print(printer_id, existing_archive.id, existing_archive.filename, filename, subtask_name)
+                await _open_run_for(existing_archive.id, printer_id)
                 _mark_owned_if_dispatched(existing_archive)
                 if existing_archive.energy_start_kwh is None:
                     await _record_energy_start(existing_archive, printer_id, db, context="subtask-resume")
@@ -5446,6 +5490,7 @@ async def on_print_start(printer_id: int, data: dict):
                 if subtask_id and existing_archive.subtask_id != subtask_id:
                     existing_archive.subtask_id = subtask_id
                     await db.commit()
+                await _open_run_for(existing_archive.id, printer_id)
                 # Also set up energy tracking if not already tracked (#941: persisted column)
                 if existing_archive.energy_start_kwh is None:
                     await _record_energy_start(existing_archive, printer_id, db, context="existing-printing")
@@ -6104,6 +6149,7 @@ async def on_print_start(printer_id: int, data: dict):
 
                 # Track as active print
                 _bind_active_print(printer_id, fallback_archive.id, fallback_archive.filename, filename, subtask_name)
+                await _open_run_for(fallback_archive.id, printer_id)
 
                 # Record starting energy if smart plug available (#941: persisted column)
                 await _record_energy_start(fallback_archive, printer_id, db, context="fallback")
@@ -6259,6 +6305,7 @@ async def on_print_start(printer_id: int, data: dict):
 
                 # Track this active print (use both original filename and downloaded filename)
                 _bind_active_print(printer_id, archive_id, downloaded_filename, filename, subtask_name)
+                await _open_run_for(archive_id, printer_id)
 
                 logger.info("Created archive %s for %s", archive.id, downloaded_filename)
 
@@ -9237,6 +9284,7 @@ async def _close_out_print(printer_id: int, data: dict):
                 logger.warning("[NOTIFY-BG] Failed to send notification without archive: %s", e, exc_info=True)
 
         spawn_background_task(_notify_no_archive(), name="notify-no-archive")
+        await _discard_open_runs_of(printer_id)
         return
 
     log_timing("Archive lookup")
@@ -9403,12 +9451,20 @@ async def _close_out_print(printer_id: int, data: dict):
     log_timing("Finance charge update")
 
     # Write independent print log entry (separate table, never touches archives)
+    # The run's id, for the energy work below: the archive's newest run is
+    # the one started last, which with plates of it on two printers need not
+    # be the one that just ended.
+    completed_run_id: int | None = None
     try:
         async with async_session() as db:
             from backend.app.models.archive import PrintArchive
-            from backend.app.services.print_log import record_archive_wear, write_log_entry
+            from backend.app.services.print_log import discard_open_runs, record_archive_wear, write_log_entry
 
             archive = await db.get(PrintArchive, archive_id)
+            if archive is None:
+                # Deleted while it printed: its run has nothing left to end on.
+                await discard_open_runs(db, printer_id)
+                await db.commit()
             if archive:
                 # Back-fill created_by_id on reprint (#730): reprint reuses the
                 # source archive row rather than creating a new one, so an
@@ -9499,6 +9555,7 @@ async def _close_out_print(printer_id: int, data: dict):
                 )
                 await record_archive_wear(db, archive, run_entry)
                 await db.commit()
+                completed_run_id = run_entry.id
                 logger.info("[PRINT_LOG] Log entry written for archive %s", archive_id)
     except Exception as e:
         logger.warning("[PRINT_LOG] Failed to write log entry for archive %s: %s", archive_id, e)
@@ -9600,13 +9657,16 @@ async def _close_out_print(printer_id: int, data: dict):
                 # Backfill the latest PrintLogEntry for this archive with energy
                 # (write_log_entry above ran before this background task completed,
                 # so energy fields are still NULL on that row).
-                latest_run = await db.execute(
-                    select(PrintLogEntry)
-                    .where(PrintLogEntry.archive_id == archive_id)
-                    .order_by(PrintLogEntry.id.desc())
-                    .limit(1)
-                )
-                run_row = latest_run.scalar_one_or_none()
+                if completed_run_id is not None:
+                    run_row = await db.get(PrintLogEntry, completed_run_id)
+                else:
+                    latest_run = await db.execute(
+                        select(PrintLogEntry)
+                        .where(PrintLogEntry.archive_id == archive_id)
+                        .order_by(PrintLogEntry.id.desc())
+                        .limit(1)
+                    )
+                    run_row = latest_run.scalar_one_or_none()
                 if run_row is not None:
                     run_row.energy_kwh = energy_used
                     run_row.energy_cost = energy_cost_value

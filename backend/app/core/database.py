@@ -5916,6 +5916,39 @@ async def _run_migrations(conn):
     await _safe_execute(conn, "ALTER TABLE print_log_entries ADD COLUMN plate_id INTEGER")
     await _backfill_print_log_plate_ids(conn)
 
+    # Migration: what describes one print, on the run (archive redesign P1).
+    # Written alongside the archive's columns, so no backfill. Nullable, no
+    # default; the types are the ones each dialect gives the model's columns.
+    double = "REAL" if is_sqlite() else "DOUBLE PRECISION"
+    stamp = "DATETIME" if is_sqlite() else "TIMESTAMP"
+    for column, kind in (
+        ("subtask_id", "VARCHAR(64)"),
+        ("billing_run_id", "VARCHAR(36)"),
+        ("cost_center_id", "INTEGER"),
+        ("wallet_charge_skipped", "BOOLEAN"),
+        ("energy_start_kwh", double),
+        ("energy_start_at", stamp),
+        ("energy_start_plug_id", "INTEGER"),
+        ("energy_start_price", double),
+        ("user_verdict_source", "VARCHAR(16)"),
+        ("user_verdict_at", stamp),
+        ("confirm_requested", "BOOLEAN"),
+        ("confirm_token", "VARCHAR(64)"),
+        ("confirm_token_used_at", stamp),
+        ("photos", "JSON"),
+        ("timelapse_path", "VARCHAR(500)"),
+        ("timelapse_baseline", "JSON"),
+        ("timelapse_baseline_unread", "BOOLEAN"),
+        ("bambuddy_forced_timelapse", "BOOLEAN"),
+        ("notes", "TEXT"),
+        ("quantity", "INTEGER"),
+    ):
+        await _safe_execute(conn, f"ALTER TABLE print_log_entries ADD COLUMN {column} {kind}")
+    await _safe_execute(
+        conn,
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_print_log_entries_confirm_token ON print_log_entries (confirm_token)",
+    )
+
     await _migrate_auth_datetimes_to_timestamp(conn)
     await _migrate_add_missing_set_null_fks(conn)
     await _migrate_wallet_transactions_keep_deleted_users(conn)

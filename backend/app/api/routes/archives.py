@@ -2430,7 +2430,13 @@ async def delete_archive(
 
         from backend.app.models.print_log import PrintLogEntry
 
-        await db.execute(sa_delete(PrintLogEntry).where(PrintLogEntry.archive_id == archive_id))
+        # Its open run too (a print started on the printer, with no queue item
+        # to refuse the delete): it has no archive left to end on.
+        await db.execute(
+            sa_delete(PrintLogEntry)
+            .where(PrintLogEntry.archive_id == archive_id)
+            .execution_options(include_open_runs=True)
+        )
         await db.commit()
 
         if not await service.delete_archive(archive_id):

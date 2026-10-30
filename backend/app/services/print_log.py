@@ -7,10 +7,11 @@ import logging
 from collections.abc import Set as AbstractSet
 from datetime import datetime, timezone
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.models.print_log import PrintLogEntry
+from backend.app.models.print_log import INCLUDE_OPEN_RUNS, RUN_OPEN, PrintLogEntry
+from backend.app.utils.local_time import utcnow_naive
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,13 @@ async def write_log_entry(
     not measured (#3310): ``completed_at`` is its start plus the slicer's
     estimate, or the reconnect. The time accuracy leaves it out.
     """
+    entry = await _entry_of_this_run(db, archive_id, printer_id, started_at)
+    filling_open_run = entry is not None and entry.status == RUN_OPEN
+    if entry is not None and filling_open_run and entry.started_at is not None:
+        # The run's own start. The archive's is its latest run's: another
+        # plate of it may have started on another printer since.
+        started_at = entry.started_at
+
     if reconciled:
         duration: int | None = 0
     elif started_at and completed_at:
@@ -101,11 +109,23 @@ async def write_log_entry(
         "created_by_id": created_by_id,
         "created_by_username": created_by_username,
     }
-    entry = await _entry_of_this_run(db, archive_id, printer_id, started_at)
+    if filling_open_run:
+        # When the run was logged, as a run written at its end always was:
+        # the date ranges of statistics and the print log go by it.
+        fields["created_at"] = utcnow_naive()
     if entry is None:
+        if archive_id is not None and started_at is not None and status != RUN_OPEN:
+            # Shadow check while the run's start moves over (archive redesign):
+            # every print start that binds an archive opens its run, so a run
+            # ending without one is a start path that does not yet.
+            logger.info("[RUN] Archive %s: no run was opened when the print started; written at its end", archive_id)
         entry = PrintLogEntry(**fields)
         db.add(entry)
     elif entry.status != status:
+        if entry.status == RUN_OPEN and None not in (entry.plate_id, plate_id) and entry.plate_id != plate_id:
+            logger.warning(
+                "[RUN] Archive %s: the run opened for plate %s ends as plate %s", archive_id, entry.plate_id, plate_id
+            )
         # The run ended differently from how it was first logged: a print
         # stopped while its printer was offline that finished after all. The
         # real outcome replaces the stop rather than counting the run twice.
@@ -187,6 +207,8 @@ async def _entry_of_this_run(
     archive_id: int | None,
     printer_id: int | None,
     started_at: datetime | None,
+    *,
+    exact: bool = False,
 ) -> PrintLogEntry | None:
     """The entry already written for this run, if any.
 
@@ -194,17 +216,136 @@ async def _entry_of_this_run(
     archive printing on two printers share the archive row (and can share its
     start time), and a reprint starts at a new time. The queue item is not
     part of it: a repeated completion finds the item already closed and
-    reports none. Without an archive, printer or start time a run can't be
-    told apart, so nothing is matched.
+    reports none. Without an archive or printer a run can't be told apart,
+    so nothing is matched.
+
+    A run opened at its start is also found as the archive's run open on the
+    printer, unless ``exact``: the archive's start is its latest run's, and
+    another plate of it may have started on another printer since.
     """
-    if archive_id is None or printer_id is None or started_at is None:
+    if archive_id is None or printer_id is None:
         return None
-    query = select(PrintLogEntry).where(
-        PrintLogEntry.archive_id == archive_id,
-        PrintLogEntry.printer_id == printer_id,
-        PrintLogEntry.started_at == started_at,
+    if started_at is None:
+        return None if exact else await _open_run_on(db, archive_id, printer_id)
+    query = (
+        select(PrintLogEntry)
+        .where(
+            PrintLogEntry.archive_id == archive_id,
+            PrintLogEntry.printer_id == printer_id,
+            PrintLogEntry.started_at == started_at,
+        )
+        # The run opened when the print started is the one this fills in.
+        .execution_options(**{INCLUDE_OPEN_RUNS: True})
     )
-    return (await db.scalars(query.order_by(PrintLogEntry.id.desc()).limit(1))).first()
+    entry = (await db.scalars(query.order_by(PrintLogEntry.id.desc()).limit(1))).first()
+    # The archive's start is its latest run's. With another plate of it
+    # started on another printer since, this printer's run is found as the
+    # one open there.
+    if entry is not None or exact:
+        return entry
+    return await _open_run_on(db, archive_id, printer_id)
+
+
+async def _open_run_on(db: AsyncSession, archive_id: int, printer_id: int) -> PrintLogEntry | None:
+    """The run of the archive open on the printer: there is one at most, a
+    printer prints one thing at a time (``open_run``)."""
+    return await db.scalar(
+        select(PrintLogEntry)
+        .where(
+            PrintLogEntry.archive_id == archive_id,
+            PrintLogEntry.printer_id == printer_id,
+            PrintLogEntry.status == RUN_OPEN,
+        )
+        .order_by(PrintLogEntry.id.desc())
+        .limit(1)
+        .execution_options(**{INCLUDE_OPEN_RUNS: True})
+    )
+
+
+async def discard_open_runs(db: AsyncSession, printer_id: int) -> None:
+    """Drop the runs left open on the printer by prints that ended without
+    their end reaching a run: cancelled at the next start as stale, or whose
+    archive was deleted. As before runs were opened at the start, such a
+    print leaves no run. Does not commit."""
+    await db.execute(
+        delete(PrintLogEntry)
+        .where(PrintLogEntry.printer_id == printer_id, PrintLogEntry.status == RUN_OPEN)
+        .execution_options(**{INCLUDE_OPEN_RUNS: True})
+    )
+
+
+async def open_run(
+    db: AsyncSession,
+    archive,
+    *,
+    printer_id: int,
+    printer_name: str | None = None,
+    plate_id: int | None = None,
+) -> PrintLogEntry | None:
+    """The run of the print that just started on ``archive``, written now with
+    the open status; its end fills it in (``write_log_entry``).
+
+    Idempotent: a print start seen again (a restart resuming the print, a
+    repeated report) finds the run it opened, keyed as its end will key it, by
+    archive, printer and start time. The queue item running it, if any, gives
+    the dispatch's own billing run and cost centre. Does not commit.
+    """
+    from backend.app.models.print_queue import PrintQueueItem
+
+    if archive.started_at is None:
+        return None
+    # Only the run of this very start: one still open on the printer from an
+    # earlier start of the archive is of a print that ended unseen.
+    entry = await _entry_of_this_run(db, archive.id, printer_id, archive.started_at, exact=True)
+    if entry is not None:
+        return entry
+    # A printer prints one thing at a time: a run still open on it is of a
+    # print that ended without its end reaching it.
+    await discard_open_runs(db, printer_id)
+    item = await db.scalar(
+        select(PrintQueueItem)
+        .where(
+            PrintQueueItem.archive_id == archive.id,
+            PrintQueueItem.printer_id == printer_id,
+            PrintQueueItem.status == "printing",
+        )
+        .order_by(PrintQueueItem.id.desc())
+        .limit(1)
+    )
+    entry = PrintLogEntry(
+        status=RUN_OPEN,
+        archive_id=archive.id,
+        queue_item_id=item.id if item is not None else None,
+        print_name=archive.print_name,
+        plate_id=plate_id if plate_id is not None else archive.plate_id,
+        printer_name=printer_name,
+        printer_id=printer_id,
+        started_at=archive.started_at,
+        filament_type=archive.filament_type,
+        filament_color=archive.filament_color,
+        thumbnail_path=archive.thumbnail_path,
+        created_by_id=archive.created_by_id,
+        subtask_id=archive.subtask_id,
+        billing_run_id=(item.billing_run_id if item is not None else None) or archive.billing_run_id,
+        cost_center_id=(item.cost_center_id if item is not None else None) or archive.cost_center_id,
+        confirm_requested=archive.confirm_requested,
+        quantity=archive.quantity,
+    )
+    db.add(entry)
+    await db.flush()
+    return entry
+
+
+async def mirror_energy_start(db: AsyncSession, archive, *, printer_id: int) -> None:
+    """Copy the archive's energy start reading onto the run it was taken for.
+    Does not commit."""
+    entry = await _entry_of_this_run(db, archive.id, printer_id, archive.started_at)
+    if entry is None or entry.status != RUN_OPEN:
+        return
+    entry.energy_start_kwh = archive.energy_start_kwh
+    entry.energy_start_at = archive.energy_start_at
+    entry.energy_start_plug_id = archive.energy_start_plug_id
+    entry.energy_start_price = archive.energy_start_price
 
 
 async def record_archive_wear(db: AsyncSession, archive, entry: PrintLogEntry) -> None:

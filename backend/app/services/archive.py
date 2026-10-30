@@ -1056,7 +1056,12 @@ async def _null_print_log_thumbnail_paths(db: AsyncSession, archive_id: int) -> 
 
     from backend.app.models.print_log import PrintLogEntry
 
-    await db.execute(sa_update(PrintLogEntry).where(PrintLogEntry.archive_id == archive_id).values(thumbnail_path=None))
+    await db.execute(
+        sa_update(PrintLogEntry)
+        .where(PrintLogEntry.archive_id == archive_id)
+        .values(thumbnail_path=None)
+        .execution_options(include_open_runs=True)
+    )
 
 
 async def _delete_related_queue_items(db: AsyncSession, archive_id: int) -> int:
