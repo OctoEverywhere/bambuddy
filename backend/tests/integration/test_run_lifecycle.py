@@ -1177,3 +1177,196 @@ async def test_a_stale_archive_cancelled_at_the_next_start_leaves_no_run_open(te
     archive = await db_session.get(PrintArchive, farm.archive)
     assert archive.status == "cancelled"
     assert await _all_runs(db_session, farm.archive) == []
+
+
+async def _charges(db_session) -> list[WalletTransaction]:
+    db_session.expire_all()
+    return list(
+        (
+            await db_session.scalars(
+                select(WalletTransaction)
+                .where(WalletTransaction.transaction_type == "print_charge")
+                .order_by(WalletTransaction.id)
+            )
+        ).all()
+    )
+
+
+async def _print_on_the_printer(test_engine, printer_id: int, status: str = "completed") -> None:
+    """A print of the archive started at the printer, no queue item, to its end."""
+    await _drive_print_start(test_engine, SimpleNamespace(id=printer_id), download_ok=False)
+    await _complete(test_engine, printer_id, status, name=SUBTASK)
+
+
+async def test_each_print_of_an_archive_started_on_the_printer_is_charged(test_engine, db_session, farm):
+    """A print without a queue item is charged under its run's own id, not
+    under the id an earlier print of the archive was charged under."""
+    await _run(test_engine, db_session, farm, plate=1, status="completed", run_id="run-1")
+    # As the scheduler's dispatch left it.
+    (await db_session.get(PrintArchive, farm.archive)).billing_run_id = "run-1"
+    await db_session.commit()
+
+    register_expected_print(farm.printer, FILE, farm.archive, plate_id=1, cost_center_id=farm.center)
+    await _print_on_the_printer(test_engine, farm.printer)
+    register_expected_print(farm.printer, FILE, farm.archive, plate_id=1, cost_center_id=farm.center)
+    await _print_on_the_printer(test_engine, farm.printer)
+
+    run_ids = [r.billing_run_id for r in await _runs(db_session, farm.archive)]
+    charged = [c.print_run_id for c in await _charges(db_session)]
+    assert len(set(charged)) == 3
+    assert charged == run_ids and run_ids[0] == "run-1"
+
+
+async def test_a_plates_end_leaves_the_budget_held_for_another_plate(test_engine, db_session, farm, printer_factory):
+    """Plate 2 queued on another printer holds a reservation on the same
+    archive: plate 1's end, without a queue item, does not free it."""
+    from backend.app.models.finance import BudgetReservation
+
+    other = (await printer_factory(name="Q")).id
+    item = PrintQueueItem(
+        printer_id=other,
+        archive_id=farm.archive,
+        status="printing",
+        position=1,
+        plate_id=2,
+        created_by_id=farm.user,
+        cost_center_id=farm.center,
+        billing_run_id="run-2",
+    )
+    db_session.add(item)
+    await db_session.flush()
+    hold = BudgetReservation(
+        cost_center_id=farm.center,
+        amount=5.0,
+        source_type="print_queue",
+        source_id=item.id,
+        print_archive_id=farm.archive,
+    )
+    db_session.add(hold)
+    await db_session.commit()
+    hold_id = hold.id
+
+    register_expected_print(farm.printer, FILE, farm.archive, plate_id=1, cost_center_id=farm.center)
+    await _print_on_the_printer(test_engine, farm.printer)
+
+    db_session.expire_all()
+    assert len(await _charges(db_session)) == 1
+    assert (await db_session.get(BudgetReservation, hold_id)).status == "active"
+
+
+async def test_a_run_is_charged_for_how_it_ended(db_session, farm):
+    """Another plate of the archive ending at the same moment may have set
+    the archive's status: the charge goes by the run's own end."""
+    from backend.app.services.finance_billing import apply_print_charge_for_archive
+
+    archive = await db_session.get(PrintArchive, farm.archive)
+    archive.status = "failed"
+    archive.extra_data = {"filament_grams_total": 100.0}
+    run = PrintLogEntry(
+        archive_id=farm.archive,
+        printer_id=farm.printer,
+        status="printing",
+        billing_run_id="run-1",
+        cost_center_id=farm.center,
+    )
+    db_session.add(run)
+    await db_session.commit()
+
+    assert await apply_print_charge_for_archive(
+        db_session,
+        farm.archive,
+        charged_user_id=farm.user,
+        run_entry_id=run.id,
+        run_status="completed",
+        filament_usage=(10.0, 100.0),
+    )
+    await db_session.commit()
+
+    [charge] = await _charges(db_session)
+    assert (charge.amount, charge.print_run_id, charge.cost_center_id) == (-5.0, "run-1", farm.center)
+
+
+async def test_a_locked_database_does_not_leave_the_run_open(test_engine, db_session, farm):
+    """The run write at a print's end is retried, or the next reconnect would
+    close the print a second time."""
+    from unittest.mock import patch
+
+    from sqlalchemy.exc import OperationalError
+
+    from backend.app.core.database import is_sqlite
+    from backend.app.services import print_log
+
+    if not is_sqlite():
+        pytest.skip("SQLite's single writer only")
+    real = print_log.write_log_entry
+    calls = []
+
+    async def locked_once(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OperationalError("UPDATE print_log_entries", {}, Exception("database is locked"))
+        return await real(*args, **kwargs)
+
+    register_expected_print(farm.printer, FILE, farm.archive, plate_id=1)
+    await _drive_print_start(test_engine, SimpleNamespace(id=farm.printer), download_ok=False)
+    with patch.object(print_log, "write_log_entry", side_effect=locked_once):
+        await _complete(test_engine, farm.printer, "completed", name=SUBTASK)
+
+    assert [r.status for r in await _all_runs(db_session, farm.archive)] == ["completed"]
+
+
+async def test_a_run_without_a_billing_id_is_charged_once(db_session, farm):
+    """A run opened before runs had their own billing id, of an archive with
+    none: the id minted at its charge stays on the run, so its end seen again
+    is not charged a second time."""
+    from backend.app.services.finance_billing import apply_print_charge_for_archive
+
+    run = PrintLogEntry(archive_id=farm.archive, printer_id=farm.printer, status="printing")
+    db_session.add(run)
+    await db_session.commit()
+
+    for _ in range(2):
+        await apply_print_charge_for_archive(
+            db_session, farm.archive, charged_user_id=farm.user, run_entry_id=run.id, run_status="completed"
+        )
+        await db_session.commit()
+
+    run_id = (await db_session.get(PrintLogEntry, run.id)).billing_run_id
+    assert [c.print_run_id for c in await _charges(db_session)] == [run_id]
+
+
+async def test_a_print_stopped_before_its_start_was_reported_frees_its_budget(test_engine, db_session, farm):
+    """Stopped while the printer still prepared: its queue item is cancelled
+    before the start report, so its run has no queue item. Its end still
+    frees what the item reserved."""
+    from backend.app.models.finance import BudgetReservation
+
+    item = PrintQueueItem(
+        printer_id=farm.printer,
+        archive_id=farm.archive,
+        status="cancelled",
+        position=1,
+        plate_id=1,
+        created_by_id=farm.user,
+        cost_center_id=farm.center,
+        billing_run_id="run-1",
+    )
+    db_session.add(item)
+    await db_session.flush()
+    hold = BudgetReservation(
+        cost_center_id=farm.center,
+        amount=5.0,
+        source_type="print_queue",
+        source_id=item.id,
+        print_archive_id=farm.archive,
+    )
+    db_session.add(hold)
+    (await db_session.get(PrintArchive, farm.archive)).cost = 0.0
+    await db_session.commit()
+    hold_id = hold.id
+
+    register_expected_print(farm.printer, FILE, farm.archive, plate_id=1, cost_center_id=farm.center)
+    await _print_on_the_printer(test_engine, farm.printer, status="cancelled")
+
+    db_session.expire_all()
+    assert (await db_session.get(BudgetReservation, hold_id)).status == "released"

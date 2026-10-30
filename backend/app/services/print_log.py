@@ -4,6 +4,7 @@ Log entries are written to a separate table and never touch archives or queue it
 """
 
 import logging
+import uuid
 from collections.abc import Set as AbstractSet
 from datetime import datetime, timezone
 
@@ -78,9 +79,10 @@ async def write_log_entry(
     such a run of its printer, the printer's latest, which its archive's start
     (another plate's since, maybe) and its closed queue item no longer find.
     """
-    entry = await _entry_of_this_run(db, archive_id, printer_id, started_at)
-    if entry is None and replaces_offline_stop and archive_id is not None and printer_id is not None:
-        entry = await _stopped_while_offline(db, archive_id, printer_id)
+    if replaces_offline_stop:
+        entry = await run_being_ended(db, archive_id, printer_id, started_at)
+    else:
+        entry = await _entry_of_this_run(db, archive_id, printer_id, started_at)
     filling_open_run = entry is not None and entry.status == RUN_OPEN
     if entry is not None and entry.started_at is not None:
         # The run's own start. The archive's is its latest run's: another
@@ -296,6 +298,18 @@ async def _entry_of_this_run(
     return await _open_run_on(db, archive_id, printer_id)
 
 
+async def run_being_ended(
+    db: AsyncSession, archive_id: int | None, printer_id: int | None, started_at: datetime | None
+) -> PrintLogEntry | None:
+    """The run a print's end fills in (``write_log_entry`` with
+    ``replaces_offline_stop``): the one written for it, else the one a stop
+    logged while the printer was offline. Billing charges the same run."""
+    entry = await _entry_of_this_run(db, archive_id, printer_id, started_at)
+    if entry is None and archive_id is not None and printer_id is not None:
+        entry = await _stopped_while_offline(db, archive_id, printer_id)
+    return entry
+
+
 async def _stopped_while_offline(db: AsyncSession, archive_id: int, printer_id: int) -> PrintLogEntry | None:
     """The run a print's real end replaces after a stop logged while the
     printer was offline: the printer's latest run, when it is of this
@@ -369,7 +383,9 @@ async def open_run(
     Idempotent: a print start seen again (a restart resuming the print, a
     repeated report) finds the run it opened, keyed as its end will key it, by
     archive, printer and start time. The queue item running it, if any, gives
-    the dispatch's own billing run and cost centre. Does not commit.
+    the dispatch's own billing run and cost centre; a run without one gets its
+    own billing run id, so each print of the archive is charged as its own.
+    Does not commit.
     """
     from backend.app.models.print_queue import PrintQueueItem
 
@@ -407,7 +423,9 @@ async def open_run(
         thumbnail_path=archive.thumbnail_path,
         created_by_id=archive.created_by_id,
         subtask_id=archive.subtask_id,
-        billing_run_id=(item.billing_run_id if item is not None else None) or archive.billing_run_id,
+        # Not the archive's: that is the latest dispatch's, or the id an
+        # earlier print of the archive was charged under.
+        billing_run_id=(item.billing_run_id if item is not None else None) or str(uuid.uuid4()),
         cost_center_id=(item.cost_center_id if item is not None else None) or archive.cost_center_id,
         confirm_requested=archive.confirm_requested,
         quantity=archive.quantity,

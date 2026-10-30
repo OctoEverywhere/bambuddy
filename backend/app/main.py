@@ -9512,9 +9512,13 @@ async def _close_out_print(printer_id: int, data: dict):
             async with async_session() as db:
                 from backend.app.models.archive import PrintArchive
                 from backend.app.services.finance_billing import apply_print_charge_for_archive
+                from backend.app.services.print_log import run_being_ended
 
                 archive = await db.get(PrintArchive, archive_id)
-                if archive and billing_run_id is None:
+                # The run this end fills in below: charged as its own, not as
+                # the archive's latest dispatch (another plate of it, maybe).
+                charged_run = await run_being_ended(db, archive_id, printer_id, archive.started_at) if archive else None
+                if archive and billing_run_id is None and charged_run is None:
                     billing_run_id = getattr(archive, "billing_run_id", None)
                 if archive and archive.created_by_id is None and _print_user_info:
                     archive.created_by_id = await _print_user_id_if_still_there(db, _print_user_info)
@@ -9543,6 +9547,8 @@ async def _close_out_print(printer_id: int, data: dict):
                     print_run_id=billing_run_id,
                     base_cost_override=billing_base_cost,
                     filament_usage=filament_usage,
+                    run_entry_id=charged_run.id if charged_run is not None else None,
+                    run_status=run_status,
                 )
                 await db.commit()
                 if charged:
@@ -9601,110 +9607,118 @@ async def _close_out_print(printer_id: int, data: dict):
     # the one started last, which with plates of it on two printers need not
     # be the one that just ended.
     completed_run_id: int | None = None
+
+    async def _write_run(db):
+        # Retried on a locked SQLite database: a run left open here would be
+        # closed again by the next reconnect's reconcile.
+        nonlocal completed_run_id
+        from backend.app.models.archive import PrintArchive
+        from backend.app.services.print_log import discard_open_runs, record_archive_wear, write_log_entry
+
+        archive = await db.get(PrintArchive, archive_id)
+        if archive is None:
+            # Deleted while it printed: its run has nothing left to end on.
+            await discard_open_runs(db, printer_id)
+            await db.commit()
+        if archive:
+            # Back-fill created_by_id on reprint (#730): reprint reuses the
+            # source archive row rather than creating a new one, so an
+            # archive that was auto-created from a printer-initiated
+            # print (created_by_id=NULL) would otherwise stay unattributed
+            # forever. When we have a print-session user AND the archive
+            # has no attribution yet, credit the current user. Never
+            # overwrite an existing attribution — the original uploader
+            # keeps ownership.
+            _print_user_id = await _print_user_id_if_still_there(db, _print_user_info)
+            if archive.created_by_id is None and _print_user_id is not None:
+                archive.created_by_id = _print_user_id
+            p_info = printer_manager.get_printer(printer_id)
+            # Per-run actuals — written to PrintLogEntry so stats reflect
+            # what THIS print actually used, not the source archive's
+            # first-run values (#1378). Helper handles the partial-print
+            # math (failed / cancelled / stopped get scaled to progress
+            # or to tracked spool deltas).
+            _run_status = data.get("status", "completed")
+            # #2614: scope the per-run estimate to the printed plate. For a
+            # multi-plate 3MF dispatched one plate at a time, the archive's
+            # filament/cost are the whole-file totals; the PrintLogEntry must
+            # reflect only this plate. No effect on single-plate archives (the
+            # plate estimate equals the whole-file value) or on the tracker
+            # path (measured spool deltas win in _compute_run_filament_grams).
+            _est_full_path = (
+                app_settings.base_dir / archive.file_path if archive.file_path else None
+            )  # SEC-PATH-OK: archive.file_path is DB-stored, internally generated
+            # The plate that printed, as billing reads it: a reprint of
+            # another plate must not log the archive's first plate.
+            _run_plate_id = billing_plate_id if billing_plate_id is not None else notify_plate_id
+            _est_grams, _est_cost = _plate_scoped_run_estimate(archive, _est_full_path, _run_plate_id)
+            if _run_plate_id is None:
+                _run_plate_id = archive.plate_id
+            _run_grams = _compute_run_filament_grams(
+                _run_status,
+                _est_grams,
+                data.get("last_progress", data.get("progress")),
+                usage_results,
+            )
+
+            # Per-run cost — prefer usage_results sum. For partial prints
+            # we deliberately skip the topup-to-estimate logic in
+            # usage_tracker (which assumes the print completed); the raw
+            # tracked-spool sum is closer to what THIS run actually cost.
+            _run_cost: float | None = None
+            if usage_results:
+                _run_cost = sum(r.get("cost") or 0 for r in usage_results) or None
+            if _run_cost is None and _run_status != "completed":
+                _run_cost = spoolman_run_cost
+            if _run_cost is None and _run_status == "completed":
+                _run_cost = _est_cost
+
+            from backend.app.models.printer import Printer as _Printer
+
+            _wear_rate = await db.scalar(select(_Printer.wear_cost_per_hour).where(_Printer.id == printer_id))
+            run_entry = await write_log_entry(
+                db,
+                archive_id=archive.id,
+                # Captured by _update_queue_status above; None for
+                # printer-initiated prints with no queue row. Batch
+                # cost/energy roll-up joins on it (#342).
+                queue_item_id=queue_item_id,
+                status=_run_status,
+                print_name=archive.print_name,
+                # The plate this run printed, as the estimate above takes
+                # it; the archive's own is the latest run's.
+                plate_id=_run_plate_id,
+                printer_name=p_info.name if p_info else None,
+                printer_id=printer_id,
+                started_at=archive.started_at,
+                completed_at=archive.completed_at,
+                filament_type=archive.filament_type,
+                filament_color=archive.filament_color,
+                filament_used_grams=_run_grams,
+                cost=_run_cost,
+                wear_cost_per_hour=_wear_rate,
+                failure_reason=archive.failure_reason,
+                thumbnail_path=archive.thumbnail_path,
+                created_by_id=archive.created_by_id,
+                created_by_username=_print_user_info.get("username") if _print_user_info else None,
+                # Reconciled completions have an unknown real end time —
+                # log 0 duration instead of the whole disconnect gap (#2592),
+                # unless it was estimated (#3310).
+                reconciled=bool(data.get("_reconciled")) and not data.get("_reconciled_completed_at"),
+                # Its time is the estimate or nothing, never measured (#3310).
+                duration_unmeasured=bool(data.get("_reconciled")),
+                # The real end of a print stopped while its printer was offline.
+                replaces_offline_stop=True,
+            )
+            await record_archive_wear(db, archive, run_entry)
+            await db.commit()
+            completed_run_id = run_entry.id
+            logger.info("[PRINT_LOG] Log entry written for archive %s", archive_id)
+
     try:
-        async with async_session() as db:
-            from backend.app.models.archive import PrintArchive
-            from backend.app.services.print_log import discard_open_runs, record_archive_wear, write_log_entry
+        from backend.app.core.database import run_with_retry
 
-            archive = await db.get(PrintArchive, archive_id)
-            if archive is None:
-                # Deleted while it printed: its run has nothing left to end on.
-                await discard_open_runs(db, printer_id)
-                await db.commit()
-            if archive:
-                # Back-fill created_by_id on reprint (#730): reprint reuses the
-                # source archive row rather than creating a new one, so an
-                # archive that was auto-created from a printer-initiated
-                # print (created_by_id=NULL) would otherwise stay unattributed
-                # forever. When we have a print-session user AND the archive
-                # has no attribution yet, credit the current user. Never
-                # overwrite an existing attribution — the original uploader
-                # keeps ownership.
-                _print_user_id = await _print_user_id_if_still_there(db, _print_user_info)
-                if archive.created_by_id is None and _print_user_id is not None:
-                    archive.created_by_id = _print_user_id
-                p_info = printer_manager.get_printer(printer_id)
-                # Per-run actuals — written to PrintLogEntry so stats reflect
-                # what THIS print actually used, not the source archive's
-                # first-run values (#1378). Helper handles the partial-print
-                # math (failed / cancelled / stopped get scaled to progress
-                # or to tracked spool deltas).
-                _run_status = data.get("status", "completed")
-                # #2614: scope the per-run estimate to the printed plate. For a
-                # multi-plate 3MF dispatched one plate at a time, the archive's
-                # filament/cost are the whole-file totals; the PrintLogEntry must
-                # reflect only this plate. No effect on single-plate archives (the
-                # plate estimate equals the whole-file value) or on the tracker
-                # path (measured spool deltas win in _compute_run_filament_grams).
-                _est_full_path = (
-                    app_settings.base_dir / archive.file_path if archive.file_path else None
-                )  # SEC-PATH-OK: archive.file_path is DB-stored, internally generated
-                # The plate that printed, as billing reads it: a reprint of
-                # another plate must not log the archive's first plate.
-                _run_plate_id = billing_plate_id if billing_plate_id is not None else notify_plate_id
-                _est_grams, _est_cost = _plate_scoped_run_estimate(archive, _est_full_path, _run_plate_id)
-                if _run_plate_id is None:
-                    _run_plate_id = archive.plate_id
-                _run_grams = _compute_run_filament_grams(
-                    _run_status,
-                    _est_grams,
-                    data.get("last_progress", data.get("progress")),
-                    usage_results,
-                )
-
-                # Per-run cost — prefer usage_results sum. For partial prints
-                # we deliberately skip the topup-to-estimate logic in
-                # usage_tracker (which assumes the print completed); the raw
-                # tracked-spool sum is closer to what THIS run actually cost.
-                _run_cost: float | None = None
-                if usage_results:
-                    _run_cost = sum(r.get("cost") or 0 for r in usage_results) or None
-                if _run_cost is None and _run_status != "completed":
-                    _run_cost = spoolman_run_cost
-                if _run_cost is None and _run_status == "completed":
-                    _run_cost = _est_cost
-
-                from backend.app.models.printer import Printer as _Printer
-
-                _wear_rate = await db.scalar(select(_Printer.wear_cost_per_hour).where(_Printer.id == printer_id))
-                run_entry = await write_log_entry(
-                    db,
-                    archive_id=archive.id,
-                    # Captured by _update_queue_status above; None for
-                    # printer-initiated prints with no queue row. Batch
-                    # cost/energy roll-up joins on it (#342).
-                    queue_item_id=queue_item_id,
-                    status=_run_status,
-                    print_name=archive.print_name,
-                    # The plate this run printed, as the estimate above takes
-                    # it; the archive's own is the latest run's.
-                    plate_id=_run_plate_id,
-                    printer_name=p_info.name if p_info else None,
-                    printer_id=printer_id,
-                    started_at=archive.started_at,
-                    completed_at=archive.completed_at,
-                    filament_type=archive.filament_type,
-                    filament_color=archive.filament_color,
-                    filament_used_grams=_run_grams,
-                    cost=_run_cost,
-                    wear_cost_per_hour=_wear_rate,
-                    failure_reason=archive.failure_reason,
-                    thumbnail_path=archive.thumbnail_path,
-                    created_by_id=archive.created_by_id,
-                    created_by_username=_print_user_info.get("username") if _print_user_info else None,
-                    # Reconciled completions have an unknown real end time —
-                    # log 0 duration instead of the whole disconnect gap (#2592),
-                    # unless it was estimated (#3310).
-                    reconciled=bool(data.get("_reconciled")) and not data.get("_reconciled_completed_at"),
-                    # Its time is the estimate or nothing, never measured (#3310).
-                    duration_unmeasured=bool(data.get("_reconciled")),
-                    # The real end of a print stopped while its printer was offline.
-                    replaces_offline_stop=True,
-                )
-                await record_archive_wear(db, archive, run_entry)
-                await db.commit()
-                completed_run_id = run_entry.id
-                logger.info("[PRINT_LOG] Log entry written for archive %s", archive_id)
+        await run_with_retry(_write_run, label="print log entry")
     except Exception as e:
         logger.warning("[PRINT_LOG] Failed to write log entry for archive %s: %s", archive_id, e)
 
