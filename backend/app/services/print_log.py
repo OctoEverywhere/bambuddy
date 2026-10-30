@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import Set as AbstractSet
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -376,12 +377,14 @@ async def open_run(
     printer_id: int,
     printer_name: str | None = None,
     plate_id: int | None = None,
+    subtask_id: str | None = None,
 ) -> PrintLogEntry | None:
     """The run of the print that just started on ``archive``, written now with
     the open status; its end fills it in (``write_log_entry``).
 
     Idempotent: a print start seen again (a restart resuming the print, a
-    repeated report) finds the run it opened, keyed as its end will key it, by
+    repeated report) finds the run it opened: by the printer's job
+    (``subtask_id``) when it has one, else keyed as its end will key it, by
     archive, printer and start time. The queue item running it, if any, gives
     the dispatch's own billing run and cost centre; a run without one gets its
     own billing run id, so each print of the archive is charged as its own.
@@ -391,6 +394,13 @@ async def open_run(
 
     if archive.started_at is None:
         return None
+    if subtask_id:
+        # The same job seen again: its run, though another plate of the
+        # archive may have started on another printer since and moved the
+        # archive's start.
+        running = await open_run_on_printer(db, printer_id, subtask_id=subtask_id)
+        if running is not None and running.archive_id == archive.id:
+            return running
     # Only the run of this very start: one still open on the printer from an
     # earlier start of the archive is of a print that ended unseen.
     entry = await _entry_of_this_run(db, archive.id, printer_id, archive.started_at, exact=True)
@@ -441,10 +451,63 @@ async def mirror_energy_start(db: AsyncSession, archive, *, printer_id: int) -> 
     entry = await _entry_of_this_run(db, archive.id, printer_id, archive.started_at)
     if entry is None or entry.status != RUN_OPEN:
         return
-    entry.energy_start_kwh = archive.energy_start_kwh
-    entry.energy_start_at = archive.energy_start_at
-    entry.energy_start_plug_id = archive.energy_start_plug_id
-    entry.energy_start_price = archive.energy_start_price
+    for name in _ENERGY_START:
+        setattr(entry, name, getattr(archive, name))
+
+
+_ENERGY_START = ("energy_start_kwh", "energy_start_at", "energy_start_plug_id", "energy_start_price")
+
+
+def _reading_taken_for(archive, entry: PrintLogEntry) -> bool:
+    """Whether the archive's energy start reading was taken for this run: the
+    archive's latest start is this run's (another plate of it started since
+    takes the reading), and it was read at or after it (an earlier print's is
+    older). A reading without its time (taken before #1251) goes by the
+    start alone."""
+    if archive.energy_start_kwh is None:
+        return False
+    if entry.started_at is None or archive.started_at is None:
+        return False
+    if _utc(archive.started_at) != _utc(entry.started_at):
+        return False
+    return archive.energy_start_at is None or _utc(archive.energy_start_at) >= _utc(entry.started_at)
+
+
+async def run_needs_energy_start(db: AsyncSession, archive, *, printer_id: int) -> bool:
+    """Whether the print running on the archive still lacks its energy start
+    reading, at a resume. Its run's, or the archive's taken for it (copied
+    onto the run then), counts; the archive's of an earlier print does not.
+    Without a run, the archive's, as before. Does not commit."""
+    entry = await _entry_of_this_run(db, archive.id, printer_id, archive.started_at)
+    if entry is None or entry.status != RUN_OPEN:
+        return archive.energy_start_kwh is None
+    if entry.energy_start_kwh is not None:
+        return False
+    if _reading_taken_for(archive, entry):
+        for name in _ENERGY_START:
+            setattr(entry, name, getattr(archive, name))
+        return False
+    return True
+
+
+def energy_start_of(entry: PrintLogEntry | None, archive) -> SimpleNamespace | None:
+    """The energy start reading of the run that ended: its own. Without one,
+    the archive's only when taken for this run (a run written only at its
+    end, or none written): another plate of the archive may have started on
+    another printer since and taken it."""
+    source = None
+    if entry is not None and entry.energy_start_kwh is not None:
+        source = entry
+    elif entry is None or _reading_taken_for(archive, entry):
+        source = archive
+    if source is None or source.energy_start_kwh is None:
+        return None
+    return SimpleNamespace(
+        kwh=source.energy_start_kwh,
+        at=source.energy_start_at,
+        plug_id=source.energy_start_plug_id,
+        price=source.energy_start_price,
+    )
 
 
 async def record_archive_wear(db: AsyncSession, archive, entry: PrintLogEntry) -> None:

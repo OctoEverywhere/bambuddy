@@ -1370,3 +1370,158 @@ async def test_a_print_stopped_before_its_start_was_reported_frees_its_budget(te
 
     db_session.expire_all()
     assert (await db_session.get(BudgetReservation, hold_id)).status == "released"
+
+
+async def test_two_plates_on_two_printers_each_get_their_own_energy(test_engine, db_session, farm, printer_factory):
+    """Each start's reading stays with its run: plate 2's start on another
+    printer does not become plate 1's start."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    plugs = {}
+
+    async def candidates(db, printer_id):
+        plug = plugs.setdefault(printer_id, MagicMock(id=printer_id))
+        plug.name = f"Plug {printer_id}"
+        return [plug]
+
+    counters = iter([10.0, 20.0, 10.5, 20.3])
+
+    async def reading(found, read, db):
+        return found[0], {"total": next(counters)}
+
+    with (
+        patch("backend.app.main.energy_plug_candidates", side_effect=candidates),
+        patch("backend.app.main.select_energy_reading", side_effect=reading),
+        patch("backend.app.services.energy_price.print_energy_cost", AsyncMock(return_value=0.1)),
+        patch("backend.app.services.energy_price.current_price", AsyncMock(return_value=0.3)),
+    ):
+        # The start helper stubs the reading out; this test takes it.
+        real_reading = patch("backend.app.main._record_energy_start", main_module._record_energy_start)
+        other = (await printer_factory(name="Q")).id
+        for printer_id, plate in ((farm.printer, 1), (other, 2)):
+            register_expected_print(printer_id, FILE, farm.archive, plate_id=plate)
+            await _drive_print_start(
+                test_engine, SimpleNamespace(id=printer_id), download_ok=False, extra_patches=(real_reading,)
+            )
+            await asyncio.sleep(1.1)
+        await _complete(test_engine, farm.printer, "completed", name=SUBTASK)
+        await _complete(test_engine, other, "completed", name=SUBTASK)
+
+    runs = {r.printer_id: r.energy_kwh for r in await _runs(db_session, farm.archive)}
+    assert runs == {farm.printer: 0.5, other: pytest.approx(0.3)}
+
+
+async def test_a_resume_takes_a_reading_when_the_archive_has_an_earlier_prints(db_session, farm):
+    """The archive's reading is an earlier print's: the resumed run still
+    needs its own. One taken for this run is copied onto it instead."""
+    from datetime import datetime
+
+    from backend.app.main import _run_needs_energy_start
+
+    archive = await db_session.get(PrintArchive, farm.archive)
+    archive.started_at = datetime(2026, 10, 30, 10)
+    archive.energy_start_kwh = 5.0
+    archive.energy_start_at = datetime(2026, 10, 29, 10)
+    run = PrintLogEntry(
+        archive_id=farm.archive, printer_id=farm.printer, status="printing", started_at=archive.started_at
+    )
+    db_session.add(run)
+    await db_session.commit()
+    run_id = run.id
+
+    assert await _run_needs_energy_start(archive, farm.printer, db_session) is True
+
+    archive.energy_start_at = datetime(2026, 10, 30, 10, 0, 5)
+    await db_session.commit()
+    assert await _run_needs_energy_start(archive, farm.printer, db_session) is False
+    db_session.expire_all()
+    assert (await db_session.get(PrintLogEntry, run_id)).energy_start_kwh == 5.0
+
+
+async def test_an_end_whose_run_was_not_written_gives_no_other_run_its_energy(test_engine, db_session, farm):
+    """The archive's newest finished run is an earlier print's."""
+    from datetime import datetime
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from backend.app.services import print_log
+
+    earlier = PrintLogEntry(
+        archive_id=farm.archive, printer_id=farm.printer, status="completed", started_at=datetime(2026, 10, 29, 9)
+    )
+    db_session.add(earlier)
+    await db_session.commit()
+    earlier_id = earlier.id
+    await _start_queued(test_engine, db_session, farm, plate=1, run_id="run-1")
+    archive = await db_session.get(PrintArchive, farm.archive)
+    archive.energy_start_kwh = 10.0
+    await db_session.commit()
+    plug = MagicMock(id=1)
+    plug.name = "Plug"
+
+    with (
+        patch("backend.app.main.energy_plug_candidates", AsyncMock(return_value=[plug])),
+        patch("backend.app.main.select_energy_reading", AsyncMock(return_value=(plug, {"total": 10.5}))),
+        patch("backend.app.services.energy_price.print_energy_cost", AsyncMock(return_value=0.1)),
+        patch("backend.app.services.energy_price.current_price", AsyncMock(return_value=0.3)),
+        patch.object(print_log, "write_log_entry", AsyncMock(side_effect=ValueError("broken"))),
+    ):
+        await _complete(test_engine, farm.printer, "completed", name=SUBTASK)
+
+    db_session.expire_all()
+    assert (await db_session.get(PrintLogEntry, earlier_id)).energy_kwh is None
+
+
+async def test_a_run_without_its_own_reading_takes_no_later_plates():
+    """Its reading was not copied at its start; plate 2 of the archive
+    started on another printer since and took the archive's."""
+    from datetime import datetime
+
+    from backend.app.services.print_log import energy_start_of
+
+    t1, t2 = datetime(2026, 10, 30, 9), datetime(2026, 10, 30, 10)
+    run = PrintLogEntry(archive_id=1, printer_id=1, status="completed", started_at=t1)
+    archive = SimpleNamespace(
+        started_at=t2,
+        energy_start_kwh=20.0,
+        energy_start_at=datetime(2026, 10, 30, 10, 0, 5),
+        energy_start_plug_id=2,
+        energy_start_price=0.3,
+    )
+    assert energy_start_of(run, archive) is None
+    # The archive's latest start is the run's own: its reading is.
+    archive.started_at = t1
+    archive.energy_start_at = datetime(2026, 10, 30, 9, 0, 5)
+    assert energy_start_of(run, archive).kwh == 20.0
+
+
+async def test_a_restart_keeps_the_first_printers_run_while_another_plate_prints(
+    test_engine, db_session, farm, printer_factory
+):
+    """Resumed by its job after the other plate started: the same run, with
+    its own start, billing id and energy reading, not one stamped with the
+    other plate's start."""
+    from sqlalchemy import update
+
+    await _two_printers_printing(test_engine, db_session, farm, printer_factory)
+    await db_session.execute(
+        update(PrintLogEntry)
+        .where(PrintLogEntry.printer_id == farm.printer)
+        .values(subtask_id="job-p", energy_start_kwh=10.0)
+        .execution_options(include_open_runs=True)
+    )
+    await db_session.commit()
+    [before] = [r for r in await _all_runs(db_session, farm.archive) if r.printer_id == farm.printer]
+    kept = (before.id, before.started_at, before.billing_run_id)
+    main_module._active_prints.clear()  # the restart
+
+    await _drive_print_start(
+        test_engine,
+        SimpleNamespace(id=farm.printer),
+        download_ok=False,
+        state_fields={"progress": 40.0},
+        raw_data={"subtask_id": "job-p"},
+    )
+
+    [after] = [r for r in await _all_runs(db_session, farm.archive) if r.printer_id == farm.printer]
+    assert (after.id, after.started_at, after.billing_run_id) == kept
+    assert after.energy_start_kwh == 10.0
