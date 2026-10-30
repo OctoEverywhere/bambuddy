@@ -1231,6 +1231,7 @@ export default {
         duration: 'Varaktighet',
         filament: 'Filament',
         cost: 'Kostnad',
+        plate: 'Platta',
       },
       status: {
         completed: 'Slutförd',

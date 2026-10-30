@@ -1231,6 +1231,7 @@ export default {
         duration: 'Duur',
         filament: 'Filament',
         cost: 'Kosten',
+        plate: 'Plaat',
       },
       status: {
         completed: 'Voltooid',

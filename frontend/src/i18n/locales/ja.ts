@@ -1225,6 +1225,7 @@ export default {
         duration: '時間',
         filament: 'フィラメント',
         cost: 'コスト',
+        plate: 'プレート',
       },
       status: {
         completed: '完了',

@@ -1226,6 +1226,7 @@ export default {
         duration: 'Süre',
         filament: 'Filament',
         cost: 'Maliyet',
+        plate: 'Plaka',
       },
       status: {
         completed: 'Tamamlandı',

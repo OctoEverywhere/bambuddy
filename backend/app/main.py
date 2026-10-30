@@ -566,6 +566,35 @@ _timelapse_baselines: dict[int, set[str]] = {}
 # so it is empty without the card being empty (#3412).
 _timelapse_baselines_unread: set[int] = set()
 
+# Archives whose last run still has work after it completed: the timelapse
+# scan and the layer timelapse stitch. Both tell their run from a later one by
+# the archive's start time, so a queue dispatch of the same file must not start
+# a new run on the archive until they end (_claim_reusable_archive in the
+# scheduler). archive_id -> number of such tasks.
+_archive_runs_finishing: dict[int, int] = {}
+
+
+async def _while_run_finishes(archive_id: int, work):
+    """Run ``work`` with the archive marked as still finishing its last run.
+    Marked by the caller's spawn already: see ``_mark_run_finishing``."""
+    try:
+        return await work
+    finally:
+        left = _archive_runs_finishing.get(archive_id, 0) - 1
+        if left > 0:
+            _archive_runs_finishing[archive_id] = left
+        else:
+            _archive_runs_finishing.pop(archive_id, None)
+
+
+def _mark_run_finishing(archive_id: int, work):
+    """``work`` wrapped to keep the archive marked until it ends. Marked now,
+    before the task starts, so no dispatch between the spawn and its first
+    step can take the archive."""
+    _archive_runs_finishing[archive_id] = _archive_runs_finishing.get(archive_id, 0) + 1
+    return _while_run_finishes(archive_id, work)
+
+
 # Track printers waiting for bed to cool after print completion.
 # Event-driven: fires when bed_temper arrives via MQTT below threshold.
 # {printer_id: {"threshold": float, "filename": str, "registered_at": float}}
@@ -6600,7 +6629,10 @@ def _schedule_timelapse_scan(archive_id: int, printer_id: int, *, plate_id: int 
     _timelapse_baselines_unread.discard(printer_id)
     baseline = _timelapse_baselines.pop(printer_id, None)
     spawn_background_task(
-        _scan_for_timelapse_with_retries(archive_id, baseline, plate_id=plate_id, baseline_unread=unread),
+        _mark_run_finishing(
+            archive_id,
+            _scan_for_timelapse_with_retries(archive_id, baseline, plate_id=plate_id, baseline_unread=unread),
+        ),
         name=f"scan-timelapse-{archive_id}",
     )
 
@@ -9407,11 +9439,10 @@ async def _close_out_print(printer_id: int, data: dict):
                 )  # SEC-PATH-OK: archive.file_path is DB-stored, internally generated
                 # The plate that printed, as billing reads it: a reprint of
                 # another plate must not log the archive's first plate.
-                _est_grams, _est_cost = _plate_scoped_run_estimate(
-                    archive,
-                    _est_full_path,
-                    billing_plate_id if billing_plate_id is not None else notify_plate_id,
-                )
+                _run_plate_id = billing_plate_id if billing_plate_id is not None else notify_plate_id
+                _est_grams, _est_cost = _plate_scoped_run_estimate(archive, _est_full_path, _run_plate_id)
+                if _run_plate_id is None:
+                    _run_plate_id = archive.plate_id
                 _run_grams = _compute_run_filament_grams(
                     _run_status,
                     _est_grams,
@@ -9443,6 +9474,9 @@ async def _close_out_print(printer_id: int, data: dict):
                     queue_item_id=queue_item_id,
                     status=_run_status,
                     print_name=archive.print_name,
+                    # The plate this run printed, as the estimate above takes
+                    # it; the archive's own is the latest run's.
+                    plate_id=_run_plate_id,
                     printer_name=p_info.name if p_info else None,
                     printer_id=printer_id,
                     started_at=archive.started_at,
@@ -10117,7 +10151,10 @@ async def _close_out_print(printer_id: int, data: dict):
                 except Exception:
                     pass  # Best-effort timelapse session cancellation on error
 
-    spawn_background_task(_background_layer_timelapse(), name="background-layer-timelapse")
+    layer_timelapse = _background_layer_timelapse()
+    if archive_id and print_status == "completed":
+        layer_timelapse = _mark_run_finishing(archive_id, layer_timelapse)
+    spawn_background_task(layer_timelapse, name="background-layer-timelapse")
 
     log_timing("All background tasks scheduled")
 

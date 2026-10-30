@@ -5909,6 +5909,13 @@ async def _run_migrations(conn):
             conn, "ALTER TABLE print_archives ADD COLUMN timelapse_baseline_unread BOOLEAN DEFAULT FALSE"
         )
 
+    # Migration: the plate each print log run printed. A library file printed
+    # again now adds its run to the file's archive, whose plate_id is only the
+    # latest run's. Nullable, no default -- identical DDL on SQLite and
+    # Postgres. Backfilled below.
+    await _safe_execute(conn, "ALTER TABLE print_log_entries ADD COLUMN plate_id INTEGER")
+    await _backfill_print_log_plate_ids(conn)
+
     await _migrate_auth_datetimes_to_timestamp(conn)
     await _migrate_add_missing_set_null_fks(conn)
     await _migrate_wallet_transactions_keep_deleted_users(conn)
@@ -5920,6 +5927,44 @@ async def _run_migrations(conn):
     await _release_slots_of_archived_spools(conn)
     await _migrate_pg_column_types(conn)
     await _migrate_pg_columns_to_model(conn)
+
+
+async def _backfill_print_log_plate_ids(conn) -> None:
+    """Give older print log runs their plate where it is known: the plate of
+    the queue item that ran it, else the archive's when the run is the
+    archive's only one. A run of a reprinted archive without a queue item is
+    left NULL: the archive's plate need not be the one that run printed.
+
+    Once only, gated by a settings flag: runs are written with their plate
+    from now on, and a later dispatch moves the archive's plate to its own
+    run's before that run is logged, which a second pass would read as the
+    old run's."""
+    from sqlalchemy import text
+
+    flag = "_backfill_print_log_plate_ids_done"
+    async with conn.begin_nested():
+        already = (
+            await conn.execute(text('SELECT value FROM settings WHERE "key" = :k'), {"k": flag})
+        ).scalar_one_or_none()
+        if already is not None:
+            return
+        await conn.execute(
+            text(
+                "UPDATE print_log_entries SET plate_id = ("
+                "SELECT q.plate_id FROM print_queue q WHERE q.id = print_log_entries.queue_item_id"
+                ") WHERE plate_id IS NULL AND queue_item_id IS NOT NULL"
+            )
+        )
+        await conn.execute(
+            text(
+                "UPDATE print_log_entries SET plate_id = ("
+                "SELECT a.plate_id FROM print_archives a WHERE a.id = print_log_entries.archive_id"
+                ") WHERE plate_id IS NULL AND queue_item_id IS NULL AND archive_id IS NOT NULL"
+                " AND (SELECT COUNT(*) FROM print_log_entries e"
+                " WHERE e.archive_id = print_log_entries.archive_id) = 1"
+            )
+        )
+        await conn.execute(text('INSERT INTO settings ("key", value) VALUES (:k, :v)'), {"k": flag, "v": "true"})
 
 
 async def _release_slots_of_archived_spools(conn) -> None:

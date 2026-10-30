@@ -1226,6 +1226,7 @@ export default {
         duration: 'Durata',
         filament: 'Filamento',
         cost: 'Costo',
+        plate: 'Piatto',
       },
       status: {
         completed: 'Completata',

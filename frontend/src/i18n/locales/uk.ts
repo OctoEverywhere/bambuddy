@@ -1230,6 +1230,7 @@ export default {
         duration: "Тривалість",
         filament: "Філамент",
         cost: "Вартість",
+        plate: "Пластина",
       },
       status: {
         completed: "Виконано",

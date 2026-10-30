@@ -32,6 +32,10 @@ class PrintLogEntry(Base):
         ForeignKey("print_queue.id", ondelete="SET NULL"), nullable=True, index=True
     )
     print_name: Mapped[str | None] = mapped_column(String(255))
+    # Which plate of a multi-plate 3MF this run printed (1-based). The archive
+    # holds one plate, its latest run's, and every run of a file shares that
+    # archive, so a run's own plate is kept here. NULL when not known.
+    plate_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     printer_name: Mapped[str | None] = mapped_column(String(255))
     printer_id: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(20))  # completed, failed, stopped, cancelled, skipped

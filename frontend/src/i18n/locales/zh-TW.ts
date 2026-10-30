@@ -1226,6 +1226,7 @@ export default {
         duration: '時長',
         filament: '耗材',
         cost: '成本',
+        plate: '板',
       },
       status: {
         completed: '已完成',

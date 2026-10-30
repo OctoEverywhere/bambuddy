@@ -35,6 +35,7 @@ async def write_log_entry(
     archive_id: int | None = None,
     queue_item_id: int | None = None,
     print_name: str | None = None,
+    plate_id: int | None = None,
     printer_name: str | None = None,
     printer_id: int | None = None,
     started_at: datetime | None = None,
@@ -80,6 +81,7 @@ async def write_log_entry(
         "archive_id": archive_id,
         "queue_item_id": queue_item_id,
         "print_name": print_name,
+        "plate_id": plate_id,
         "printer_name": printer_name,
         "printer_id": printer_id,
         "status": status,
@@ -163,7 +165,15 @@ async def other_runs_of(db: AsyncSession, archive) -> int:
 # completion that finds the queue item already closed reports none. Its
 # outcome (status, reason, grams, cost) is replaced as reported.
 _KEPT_WHEN_NOT_REPORTED = frozenset(
-    {"queue_item_id", "print_name", "printer_name", "thumbnail_path", "created_by_id", "created_by_username"}
+    {
+        "queue_item_id",
+        "print_name",
+        "plate_id",
+        "printer_name",
+        "thumbnail_path",
+        "created_by_id",
+        "created_by_username",
+    }
 )
 
 

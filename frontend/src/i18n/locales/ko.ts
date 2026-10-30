@@ -1281,7 +1281,8 @@ export default {
         status: '상태',
         duration: '소요 시간',
         filament: '필라멘트',
-        cost: '비용'
+        cost: '비용',
+        plate: '플레이트'
       },
       status: {
         completed: '완료',

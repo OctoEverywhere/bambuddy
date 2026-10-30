@@ -327,6 +327,21 @@ describe('ArchivesPage', () => {
       });
     });
 
+    it('shows the picture of the plate the title names', async () => {
+      // A file printed again shows its latest run's plate; the stored
+      // thumbnail is the first plate's.
+      server.use(
+        http.get('/api/v1/archives/', () =>
+          HttpResponse.json([{ ...mockArchives[1], plate_id: 3 }])
+        )
+      );
+
+      render(<ArchivesPage />);
+
+      const img = await screen.findByAltText('Bracket v2');
+      expect(img.getAttribute('src')).toContain(`/archives/${mockArchives[1].id}/plate-thumbnail/3`);
+    });
+
     it('leaves the title alone for a print on plate 1', async () => {
       // The queue records a plate for single-plate files too, so an ungated
       // label reads "Plate 1" on ordinary prints (#2796).

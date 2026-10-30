@@ -959,6 +959,7 @@ export interface PrintLogEntry {
   id: number;
   archive_id: number | null;
   print_name: string | null;
+  plate_id?: number | null;
   printer_name: string | null;
   printer_id: number | null;
   status: string;

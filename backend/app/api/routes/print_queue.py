@@ -2944,6 +2944,7 @@ async def stop_queue_item(
                 archive_id=archive.id,
                 queue_item_id=item.id,
                 print_name=archive.print_name,
+                plate_id=item.plate_id if item.plate_id is not None else archive.plate_id,
                 printer_name=await db.scalar(select(Printer.name).where(Printer.id == printer_id)),
                 printer_id=printer_id,
                 started_at=archive.started_at,

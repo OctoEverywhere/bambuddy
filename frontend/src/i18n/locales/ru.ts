@@ -1181,6 +1181,7 @@ export default {
         duration: "Длительность",
         filament: "Филамент",
         cost: "Стоимость",
+        plate: "Пластина",
       },
       status: {
         completed: "Завершено",
