@@ -5913,6 +5913,47 @@ async def _run_migrations(conn):
             conn, "ALTER TABLE print_archives ADD COLUMN timelapse_baseline_unread BOOLEAN DEFAULT FALSE"
         )
 
+    # Migration: the plate each print log run printed. A library file printed
+    # again now adds its run to the file's archive, whose plate_id is only the
+    # latest run's. Nullable, no default -- identical DDL on SQLite and
+    # Postgres. Backfilled below.
+    await _safe_execute(conn, "ALTER TABLE print_log_entries ADD COLUMN plate_id INTEGER")
+    await _backfill_print_log_plate_ids(conn)
+
+    # Migration: what describes one print, on the run (archive redesign P1).
+    # Written alongside the archive's columns, so no backfill. Nullable, no
+    # default; the types are the ones each dialect gives the model's columns.
+    double = "REAL" if is_sqlite() else "DOUBLE PRECISION"
+    stamp = "DATETIME" if is_sqlite() else "TIMESTAMP"
+    for column, kind in (
+        ("subtask_id", "VARCHAR(64)"),
+        ("billing_run_id", "VARCHAR(36)"),
+        ("cost_center_id", "INTEGER"),
+        ("wallet_charge_skipped", "BOOLEAN"),
+        ("energy_start_kwh", double),
+        ("energy_start_at", stamp),
+        ("energy_start_plug_id", "INTEGER"),
+        ("energy_start_price", double),
+        ("user_verdict_source", "VARCHAR(16)"),
+        ("user_verdict_at", stamp),
+        ("confirm_requested", "BOOLEAN"),
+        ("confirm_token", "VARCHAR(64)"),
+        ("confirm_token_used_at", stamp),
+        ("photos", "JSON"),
+        ("timelapse_path", "VARCHAR(500)"),
+        ("timelapse_baseline", "JSON"),
+        ("timelapse_baseline_unread", "BOOLEAN"),
+        ("bambuddy_forced_timelapse", "BOOLEAN"),
+        ("notes", "TEXT"),
+        ("quantity", "INTEGER"),
+        ("ended_offline", "BOOLEAN"),
+    ):
+        await _safe_execute(conn, f"ALTER TABLE print_log_entries ADD COLUMN {column} {kind}")
+    await _safe_execute(
+        conn,
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_print_log_entries_confirm_token ON print_log_entries (confirm_token)",
+    )
+
     await _migrate_auth_datetimes_to_timestamp(conn)
     await _migrate_add_missing_set_null_fks(conn)
     await _migrate_wallet_transactions_keep_deleted_users(conn)
@@ -5924,6 +5965,44 @@ async def _run_migrations(conn):
     await _release_slots_of_archived_spools(conn)
     await _migrate_pg_column_types(conn)
     await _migrate_pg_columns_to_model(conn)
+
+
+async def _backfill_print_log_plate_ids(conn) -> None:
+    """Give older print log runs their plate where it is known: the plate of
+    the queue item that ran it, else the archive's when the run is the
+    archive's only one. A run of a reprinted archive without a queue item is
+    left NULL: the archive's plate need not be the one that run printed.
+
+    Once only, gated by a settings flag: runs are written with their plate
+    from now on, and a later dispatch moves the archive's plate to its own
+    run's before that run is logged, which a second pass would read as the
+    old run's."""
+    from sqlalchemy import text
+
+    flag = "_backfill_print_log_plate_ids_done"
+    async with conn.begin_nested():
+        already = (
+            await conn.execute(text('SELECT value FROM settings WHERE "key" = :k'), {"k": flag})
+        ).scalar_one_or_none()
+        if already is not None:
+            return
+        await conn.execute(
+            text(
+                "UPDATE print_log_entries SET plate_id = ("
+                "SELECT q.plate_id FROM print_queue q WHERE q.id = print_log_entries.queue_item_id"
+                ") WHERE plate_id IS NULL AND queue_item_id IS NOT NULL"
+            )
+        )
+        await conn.execute(
+            text(
+                "UPDATE print_log_entries SET plate_id = ("
+                "SELECT a.plate_id FROM print_archives a WHERE a.id = print_log_entries.archive_id"
+                ") WHERE plate_id IS NULL AND queue_item_id IS NULL AND archive_id IS NOT NULL"
+                " AND (SELECT COUNT(*) FROM print_log_entries e"
+                " WHERE e.archive_id = print_log_entries.archive_id) = 1"
+            )
+        )
+        await conn.execute(text('INSERT INTO settings ("key", value) VALUES (:k, :v)'), {"k": flag, "v": "true"})
 
 
 async def _release_slots_of_archived_spools(conn) -> None:

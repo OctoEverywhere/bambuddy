@@ -1231,6 +1231,7 @@ export default {
         duration: 'Varaktighet',
         filament: 'Filament',
         cost: 'Kostnad',
+        plate: 'Platta',
       },
       status: {
         completed: 'Slutförd',
@@ -1856,6 +1857,7 @@ export default {
     exportFailed: 'Kunde inte exportera',
     layoutReset: 'Layout återställd',
     recalculatedCosts: 'Omberäknade kostnader för {{count}} arkiv',
+    recalculateSpoolmanUnreachable: 'Spoolman kunde inte nås: {{count}} förbrukningsposter för dess spolar behöll sitt gamla pris',
     recalculateFailed: 'Kunde inte omberäkna kostnader',
     // Loading
     loadingStats: 'Laddar statistik...',
@@ -4872,6 +4874,9 @@ errors: {
     presetsHidden: '{{count}} dold',
     showAllPresets: 'Visa alla',
     showFewerPresets: 'Visa färre',
+    searchPresets: 'Sök förinställningar...',
+    closeSearch: 'Stäng sökning',
+    noMatchingPresets: 'Inga matchande förinställningar hittade.',
     processSettings: 'Processinställningar',
     processSettingsHint: "Justera den valda förinställningen för denna slicing. Allt du inte rör förblir som förinställningen definierar det.",
     processSettingsChanged: '{{count}} ändrades',
@@ -7461,6 +7466,7 @@ errors: {
       assignToAms: 'Tilldela till AMS',
       syncWeight: 'Synkronisera vikt',
       addToInventory: 'Lägg till i inventarium',
+      quickAddFromTag: 'Lägger till spolen med uppgifterna från dess Bambu-tagg. Du kan ändra dem senare i Bambuddy.',
       assignToAmsTitle: 'Tilldela till AMS',
       selectSlot: 'Välj ett fack',
       assign: 'Tilldela',
@@ -7693,6 +7699,9 @@ errors: {
         skip: 'Körs inte i Docker — inte tillämpligt.',
         skip_unknown: 'Bambuddy körs i {{runtime}}, men dess nätverksläge kunde inte fastställas. Om skrivarupptäckt eller den virtuella skrivaren inte fungerar, återskapa containern med värdnätverk.',
         skip_system_container: 'Bambuddy körs i en {{runtime}} systemcontainer, som sitter på LAN som en virtuell maskin — inte tillämpligt.',
+        pass_macvlan: 'Körs i {{runtime}} på ett macvlan-nätverk, med en egen adress på LAN.',
+        pass_ipvlan: 'Körs i {{runtime}} på ett ipvlan-nätverk (L2), med en egen adress på LAN.',
+        warn_ipvlan_l3: 'Bambuddy körs i {{runtime}} på ett ipvlan-nätverk i L3-läge. L3-läget släpper inte igenom broadcast eller multicast, så slicern hittar inte den virtuella skrivaren och skrivare kan bara hittas med nätverksskanningen — använd ett macvlan-nätverk eller ipvlan L2-läge i stället.',
       },
       subnet: {
         title: 'Nätverkssubnät',

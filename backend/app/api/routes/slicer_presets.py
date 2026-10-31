@@ -75,6 +75,7 @@ from backend.app.utils.printer_models import (
     normalize_printer_model,
     normalize_printer_model_id,
 )
+from backend.app.utils.slicer_strings import first_slicer_string, slicer_strings
 
 logger = logging.getLogger(__name__)
 
@@ -182,13 +183,14 @@ async def _fetch_cloud_presets(
             # that share names with private ones get deduped out within the cloud
             # tier itself.
             seen_names: set[str] = set()
-            for entry in type_data.get("private", []) + type_data.get("public", []):
-                name = entry.get("name")
-                setting_id = entry.get("setting_id") or entry.get("id")
-                if not name or not setting_id or name in seen_names:
-                    continue
-                seen_names.add(name)
-                slots[slot].append(UnifiedPreset(id=setting_id, name=name, source="cloud"))
+            for stock, entries in ((False, type_data.get("private", [])), (True, type_data.get("public", []))):
+                for entry in entries:
+                    name = entry.get("name")
+                    setting_id = entry.get("setting_id") or entry.get("id")
+                    if not name or not setting_id or name in seen_names:
+                        continue
+                    seen_names.add(name)
+                    slots[slot].append(UnifiedPreset(id=setting_id, name=name, source="cloud", stock=stock))
 
         # Cloud filament presets carry no metadata in this response on
         # purpose: the per-preset detail endpoint
@@ -277,18 +279,10 @@ async def _fetch_orca_cloud_presets(
             filament_colour: str | None = None
             if slot == "filament":
                 # Bambu/Orca filament profiles store these as single-element
-                # arrays (the historical multi-extruder shape). Extract the
-                # first non-empty element for both.
-                ft = content.get("filament_type")
-                if isinstance(ft, list) and ft and isinstance(ft[0], str):
-                    filament_type = ft[0]
-                elif isinstance(ft, str):
-                    filament_type = ft
-                fc = content.get("default_filament_colour")
-                if isinstance(fc, list) and fc and isinstance(fc[0], str):
-                    filament_colour = fc[0]
-                elif isinstance(fc, str):
-                    filament_colour = fc
+                # lists (the historical multi-extruder shape) — a JSON array or
+                # an INI-style string. Take the first non-empty element.
+                filament_type = first_slicer_string(content.get("filament_type"))
+                filament_colour = first_slicer_string(content.get("default_filament_colour"))
             preset = UnifiedPreset(
                 id=str(preset_id),
                 name=str(name),
@@ -357,19 +351,13 @@ def _content_compatible_printers(content: dict) -> list[str] | None:
     ``content``, and an entry of the sidecar's bundled listing.
 
     Orca profiles carry it as a list of printer-preset names (the same shape
-    ``orca_profiles.py`` stores on import); a single-printer profile may store
-    a bare string. Returns ``None`` for missing / empty / malformed values so
-    the caller leaves the field unset and the SliceModal falls back to the
-    name-based matcher, rather than treating "no data" as "compatible with
-    nothing".
+    ``orca_profiles.py`` stores on import) or as one INI-style string — see
+    :func:`slicer_strings`. Returns ``None`` for missing / empty / malformed
+    values so the caller leaves the field unset and the SliceModal falls back
+    to the name-based matcher, rather than treating "no data" as "compatible
+    with nothing".
     """
-    raw = content.get("compatible_printers")
-    if isinstance(raw, str):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return None
-    names = [s.strip() for s in raw if isinstance(s, str) and s.strip()]
-    return names or None
+    return slicer_strings(content.get("compatible_printers")) or None
 
 
 def _parse_compatible_printers(raw: str | None) -> list[str] | None:
@@ -384,8 +372,7 @@ def _parse_compatible_printers(raw: str | None) -> list[str] | None:
         return None
     if not isinstance(data, list):
         return None
-    names = [s for s in data if isinstance(s, str) and s.strip()]
-    return names or None
+    return slicer_strings(data) or None
 
 
 def _parse_filament_metadata(setting_json: str | None) -> tuple[str | None, str | None]:
@@ -766,6 +753,8 @@ async def list_unified_presets(
     standard = await _fetch_bundled_presets(db, refresh=refresh)
 
     orca_cloud, cloud, local, standard = _enrich_cloud_metadata(orca_cloud, cloud, local, standard)
+    stock_aliases = _stock_aliases(cloud, standard)
+    standard = _drop_aliased(standard, stock_aliases)
 
     return UnifiedPresetsResponse(
         orca_cloud=UnifiedPresetsBySlot(**orca_cloud),
@@ -774,7 +763,62 @@ async def list_unified_presets(
         standard=UnifiedPresetsBySlot(**standard),
         cloud_status=cloud_status,
         orca_cloud_status=orca_cloud_status,
+        stock_aliases=stock_aliases,
     )
+
+
+def _stock_aliases(
+    cloud: dict[str, list[UnifiedPreset]],
+    standard: dict[str, list[UnifiedPreset]],
+) -> dict[str, PresetRef]:
+    """Map each Standard preset with a Bambu Cloud stock twin to that twin (#3386).
+
+    Bambu's stock cloud presets are the bundled ones again, so a name is
+    listed once, under Bambu Cloud: Standard is the preferred sidecar's own
+    bundle (OrcaSlicer's re-authored ``@BBL`` profiles when Orca is
+    preferred), and the cloud copy is the one signed-in users already slice
+    with by default. Signed out there is no cloud list, so nothing is
+    aliased. The keys are ``"standard:<id>"``, so a pipeline or AMS slot
+    saved with a hidden Standard copy resolves to the cloud one.
+    """
+    aliases: dict[str, PresetRef] = {}
+    for slot, presets in cloud.items():
+        twins = {p.name: p for p in presets if p.stock}
+        for p in standard.get(slot, []):
+            twin = twins.get(p.name)
+            if twin is not None:
+                aliases[f"standard:{p.id}"] = PresetRef(source="cloud", id=twin.id)
+    return aliases
+
+
+def _drop_aliased(
+    presets: dict[str, list[UnifiedPreset]], aliases: dict[str, PresetRef]
+) -> dict[str, list[UnifiedPreset]]:
+    """``presets`` without those :func:`_stock_aliases` maps to a twin.
+
+    Runs after :func:`_enrich_cloud_metadata`, so the #2628 bridge has
+    already seen both copies.
+    """
+    return {
+        slot: [p for p in slot_presets if f"{p.source}:{p.id}" not in aliases] for slot, slot_presets in presets.items()
+    }
+
+
+async def load_stock_aliases(db: AsyncSession, user: User | None) -> dict[str, PresetRef]:
+    """The listing's ``stock_aliases`` for ``user``, from the cached tiers.
+
+    For callers that slice from stored refs without the Slice dialog, so a
+    pipeline slices with the profile the dialog shows for it. Both fetches
+    degrade to empty rather than raise, which leaves every ref as stored.
+    """
+    cloud, _status = await _fetch_cloud_presets(db, user)
+    standard = await _fetch_bundled_presets(db)
+    return _stock_aliases(cloud, standard)
+
+
+def listed_ref(aliases: dict[str, PresetRef], ref: PresetRef) -> PresetRef:
+    """The ref the listing shows for ``ref``: its cloud twin if hidden, else itself."""
+    return aliases.get(f"{ref.source}:{ref.id}", ref)
 
 
 def _loaded_spool_tray(raw: dict, ams_id: int, tray_id: int, saved: SlotPresetMapping | None) -> LoadedSpoolTray:

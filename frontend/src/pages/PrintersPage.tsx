@@ -6,6 +6,7 @@ import { formatPrintName } from '../utils/printName';
 import { isBedSlinger } from '../utils/bedSlinger';
 import { computePopoverPosition, type PopoverPosition } from '../utils/popoverPosition';
 import {
+  isStandaloneWebApp,
   openCameraWindow,
   readStoredCameraViewMode,
   storeCameraViewMode,
@@ -3591,6 +3592,7 @@ function PrinterCard({
   // Opening a camera in a given mode, without touching which mode is remembered
   // -- the split button's two halves want the same action but disagree about
   // whether the choice was deliberate enough to keep.
+  const webApp = isStandaloneWebApp();
   const openCameraIn = (mode: CameraViewMode) => {
     if (mode === 'embedded' && onOpenEmbeddedCamera) {
       onOpenEmbeddedCamera(printer.id, printer.name);
@@ -6670,10 +6672,12 @@ function PrinterCard({
                     onClick={() => openCameraIn(cameraViewMode)}
                     disabled={!status?.connected || !hasPermission('camera:view')}
                     title={!hasPermission('camera:view') ? t('printers.permission.noCamera') : (cameraViewMode === 'embedded' ? t('printers.openCameraOverlay') : t('printers.openCameraWindow'))}
-                    className={`${footerIconButtonClass} !rounded-r-none`}
+                    className={webApp ? footerIconButtonClass : `${footerIconButtonClass} !rounded-r-none`}
                   >
                     <Video className="w-[var(--pc-i4,1rem)] h-[var(--pc-i4,1rem)]" />
                   </Button>
+                  {/* A home-screen web app has only the overlay (#3419). */}
+                  {!webApp && (
                   <Button
                     variant="secondary"
                     size="sm"
@@ -6693,8 +6697,9 @@ function PrinterCard({
                   >
                     <ChevronDown className="w-3 h-3" />
                   </Button>
+                  )}
                 </div>
-                {cameraMenuAnchor && (
+                {cameraMenuAnchor && !webApp && (
                   <ContextMenu
                     x={cameraMenuAnchor.x}
                     y={cameraMenuAnchor.y}
@@ -8999,8 +9004,11 @@ export function PrintersPage() {
   // The local choice wins over the stored one: someone without settings:update
   // cannot write their pick back, and a preference that silently reverted on
   // the next render would be worse than none at all.
-  const cameraViewMode: CameraViewMode =
-    chosenCameraViewMode ?? (settings?.camera_view_mode === 'embedded' ? 'embedded' : 'window');
+  // A home-screen web app has no second window to open: it would take over
+  // the app with no way back (#3419), so its cameras always open as overlays.
+  const cameraViewMode: CameraViewMode = isStandaloneWebApp()
+    ? 'embedded'
+    : chosenCameraViewMode ?? (settings?.camera_view_mode === 'embedded' ? 'embedded' : 'window');
 
   const selectCameraViewMode = useCallback((mode: CameraViewMode) => {
     storeCameraViewMode(mode);

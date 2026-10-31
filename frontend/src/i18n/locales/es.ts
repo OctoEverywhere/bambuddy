@@ -1226,6 +1226,7 @@ export default {
         duration: 'Duración',
         filament: 'Filamento',
         cost: 'Coste',
+        plate: 'Cama',
       },
       status: {
         completed: 'Completada',
@@ -1840,6 +1841,7 @@ export default {
     exportFailed: 'Error en la exportación',
     layoutReset: 'Disposición restablecida',
     recalculatedCosts: 'Costes recalculados para {{count}} archivos',
+    recalculateSpoolmanUnreachable: 'No se pudo conectar con Spoolman: {{count}} registros de consumo de sus bobinas conservan su precio anterior',
     recalculateFailed: 'Error al recalcular los costes',
     // Loading
     loadingStats: 'Cargando estadísticas...',
@@ -4840,6 +4842,9 @@ export default {
     presetsHidden: '{{count}} ocultos',
     showAllPresets: 'Mostrar todos',
     showFewerPresets: 'Mostrar menos',
+    searchPresets: 'Buscar preajustes...',
+    closeSearch: 'Cerrar búsqueda',
+    noMatchingPresets: 'No se encontraron preajustes coincidentes.',
     processSettings: 'Ajustes de proceso',
     processSettingsHint: 'Ajusta el perfil seleccionado para este corte. Todo lo que no toques se mantiene como lo define el perfil.',
     processSettingsChanged: '{{count}} cambiados',
@@ -7420,6 +7425,7 @@ export default {
       assignToAms: 'Asignar al AMS',
       syncWeight: 'Sincronizar peso',
       addToInventory: 'Añadir al inventario',
+      quickAddFromTag: 'Añade esta bobina con los datos leídos de su etiqueta Bambu. Puedes editarlos más tarde en Bambuddy.',
       assignToAmsTitle: 'Asignar al AMS',
       selectSlot: 'Seleccione una ranura',
       assign: 'Asignar',
@@ -7652,6 +7658,9 @@ export default {
         skip: 'No se está ejecutando en un contenedor — no aplicable.',
         skip_unknown: 'Bambuddy se está ejecutando en {{runtime}}, pero no se pudo determinar su modo de red. Si la detección de impresoras o la impresora virtual no funcionan, vuelva a crear el contenedor con red de host.',
         skip_system_container: 'Bambuddy se está ejecutando en un contenedor de sistema {{runtime}}, que está en la LAN como una máquina virtual — no aplicable.',
+        pass_macvlan: 'Ejecutándose en {{runtime}} en una red macvlan, con su propia dirección en la LAN.',
+        pass_ipvlan: 'Ejecutándose en {{runtime}} en una red ipvlan (L2), con su propia dirección en la LAN.',
+        warn_ipvlan_l3: 'Bambuddy se está ejecutando en {{runtime}} en una red ipvlan en modo L3. El modo L3 no transmite broadcast ni multicast, por lo que el slicer no encuentra la impresora virtual y las impresoras solo se pueden encontrar con el escaneo de subred — usa una red macvlan o el modo ipvlan L2.',
       },
       subnet: {
         title: 'Subred de la red',

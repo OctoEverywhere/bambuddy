@@ -1226,6 +1226,7 @@ export default {
         duration: 'Süre',
         filament: 'Filament',
         cost: 'Maliyet',
+        plate: 'Plaka',
       },
       status: {
         completed: 'Tamamlandı',
@@ -1840,6 +1841,7 @@ export default {
     exportFailed: 'Dışa aktarma başarısız',
     layoutReset: 'Düzen sıfırlandı',
     recalculatedCosts: '{{count}} arşiv için maliyetler yeniden hesaplandı',
+    recalculateSpoolmanUnreachable: "Spoolman'a ulaşılamadı: makaralarının {{count}} kullanım kaydı eski fiyatını korudu",
     recalculateFailed: 'Maliyetler yeniden hesaplanamadı',
     // Yükleniyor
     loadingStats: 'İstatistikler yükleniyor...',
@@ -4827,6 +4829,9 @@ export default {
     presetsHidden: '{{count}} gizli',
     showAllPresets: 'Tümünü göster',
     showFewerPresets: 'Daha az göster',
+    searchPresets: 'Ön ayarlarda ara...',
+    closeSearch: 'Aramayı kapat',
+    noMatchingPresets: 'Eşleşen ön ayar bulunamadı.',
     processSettings: 'İşlem ayarları',
     processSettingsHint: 'Seçilen ön ayarı bu dilimleme için düzenleyin. Dokunmadığınız her şey ön ayardaki gibi kalır.',
     processSettingsChanged: '{{count}} değişti',
@@ -7356,6 +7361,7 @@ export default {
       assignToAms: "AMS'e Ata",
       syncWeight: 'Ağırlığı Senkronize Et',
       addToInventory: 'Envantere Ekle',
+      quickAddFromTag: 'Bu makarayı Bambu etiketinden okunan bilgilerle ekler. Bunları daha sonra Bambuddy içinde düzenleyebilirsiniz.',
       assignToAmsTitle: "AMS'e Ata",
       selectSlot: 'Bir yuva seçin',
       assign: 'Ata',
@@ -7583,6 +7589,9 @@ export default {
         skip: 'Bir konteyner içinde çalışmıyor — uygulanamaz.',
         skip_unknown: 'Bambuddy {{runtime}} içinde çalışıyor ancak ağ modu belirlenemedi. Yazıcı keşfi veya Sanal Yazıcı çalışmıyorsa konteyneri ana bilgisayar ağıyla yeniden oluşturun.',
         skip_system_container: 'Bambuddy, sanal makine gibi doğrudan yerel ağda bulunan bir {{runtime}} sistem konteyneri içinde çalışıyor — uygulanamaz.',
+        pass_macvlan: '{{runtime}} içinde macvlan ağında, yerel ağda kendi adresiyle çalışıyor.',
+        pass_ipvlan: '{{runtime}} içinde ipvlan ağında (L2), yerel ağda kendi adresiyle çalışıyor.',
+        warn_ipvlan_l3: 'Bambuddy, {{runtime}} içinde L3 modundaki bir ipvlan ağında çalışıyor. L3 modu yayın ve çoklu yayın paketlerini iletmez, bu nedenle dilimleyici sanal yazıcıyı bulamaz ve yazıcılar yalnızca alt ağ taramasıyla bulunabilir — bunun yerine bir macvlan ağı veya ipvlan L2 modunu kullanın.',
       },
       subnet: {
         title: 'Ağ alt ağı',

@@ -1226,6 +1226,7 @@ export default {
         duration: '时长',
         filament: '耗材',
         cost: '成本',
+        plate: '板',
       },
       status: {
         completed: '已完成',
@@ -1839,6 +1840,7 @@ export default {
     exportFailed: '导出失败',
     layoutReset: '布局已重置',
     recalculatedCosts: '已为 {{count}} 个归档重新计算成本',
+    recalculateSpoolmanUnreachable: '无法连接 Spoolman：其线轴的 {{count}} 条用量记录保留原价',
     recalculateFailed: '重新计算成本失败',
     // Loading
     loadingStats: '加载统计数据中...',
@@ -4825,6 +4827,9 @@ export default {
     presetsHidden: '已隐藏 {{count}} 项',
     showAllPresets: '显示全部',
     showFewerPresets: '显示较少',
+    searchPresets: '搜索预设...',
+    closeSearch: '关闭搜索',
+    noMatchingPresets: '未找到匹配的预设。',
     processSettings: '工艺设置',
     processSettingsHint: '为本次切片调整所选预设。未改动的项目仍按预设定义。',
     processSettingsChanged: '已更改 {{count}} 项',
@@ -7397,6 +7402,7 @@ export default {
       assignToAms: '分配到 AMS',
       syncWeight: '同步重量',
       addToInventory: '添加到库存',
+      quickAddFromTag: '使用从 Bambu 标签读取的信息添加此料卷。之后可以在 Bambuddy 中编辑。',
       assignToAmsTitle: '分配到 AMS',
       selectSlot: '选择槽位',
       assign: '分配',
@@ -7629,6 +7635,9 @@ export default {
         skip: '未在容器中运行 — 不适用。',
         skip_unknown: 'Bambuddy 正在 {{runtime}} 中运行，但无法确定其网络模式。如果打印机发现或虚拟打印机无法使用，请使用 host 网络重新创建容器。',
         skip_system_container: 'Bambuddy 正在 {{runtime}} 系统容器中运行，它像虚拟机一样直接位于局域网中 — 不适用。',
+        pass_macvlan: '正在 {{runtime}} 的 macvlan 网络中运行，在局域网中拥有自己的地址。',
+        pass_ipvlan: '正在 {{runtime}} 的 ipvlan 网络 (L2) 中运行，在局域网中拥有自己的地址。',
+        warn_ipvlan_l3: 'Bambuddy 正在 {{runtime}} 的 L3 模式 ipvlan 网络中运行。L3 模式不转发广播和组播，因此切片软件无法找到虚拟打印机，打印机也只能通过子网扫描找到 — 请改用 macvlan 网络或 ipvlan L2 模式。',
       },
       subnet: {
         title: '网络子网',

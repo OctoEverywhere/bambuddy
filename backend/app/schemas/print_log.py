@@ -17,6 +17,7 @@ class PrintLogEntrySchema(BaseModel):
     id: int
     archive_id: int | None = None
     print_name: str | None = None
+    plate_id: int | None = None
     printer_name: str | None = None
     printer_id: int | None = None
     status: str

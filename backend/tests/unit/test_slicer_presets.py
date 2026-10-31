@@ -2,7 +2,8 @@
 
 The endpoint stitches together four preset sources (local / orca_cloud /
 cloud / standard). It does NOT dedup across tiers — every tier surfaces
-its full list so the user can pick any source. Bambu Cloud filament
+its full list so the user can pick any source — except the Standard
+presets that Bambu Cloud's stock list also has (#3386). Bambu Cloud filament
 metadata is enriched from same-named entries in the other tiers so it
 can still score in the SliceModal's auto-pick. These tests pin the
 enrich behaviour, the cloud-status mapping, and the per-user / sidecar
@@ -18,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from backend.app.api.routes import slicer_presets as sp
+from backend.app.schemas.slicer import PresetRef
 from backend.app.schemas.slicer_presets import UnifiedPreset
 
 
@@ -534,6 +536,62 @@ class TestFetchOrcaCloudPresets:
         assert [p.inherits for p in slots["printer"]] == ["Bambu Lab H2D 0.4 nozzle", None, None]
 
     @pytest.mark.asyncio
+    async def test_quoted_compatible_printers_are_unquoted(self):
+        """#3380: Orca Cloud returns list settings INI-style — one string of
+        quoted items joined by ``;``. Left as-is, the names never equal the
+        selected printer preset and the SliceModal hides the profile."""
+        sp._orca_cloud_cache.clear()
+        svc_mock = MagicMock()
+        svc_mock.list_profiles = AsyncMock(
+            return_value=[
+                {
+                    "id": "f1",
+                    "name": "SUNLU PLA Meta @Bambu Lab X1 Carbon 0.4 nozzle",
+                    "content": {
+                        "type": "filament",
+                        "filament_type": "PLA",
+                        "default_filament_colour": '""',
+                        "compatible_printers": '"Bambu Lab X1 Carbon 0.4 nozzle";"Bambu Lab H2C 0.4 nozzle"',
+                    },
+                },
+                {"id": "f2", "name": "Only quotes", "content": {"type": "filament", "compatible_printers": '""'}},
+                {
+                    "id": "f3",
+                    "name": "Escaped",
+                    "content": {
+                        "type": "filament",
+                        "default_filament_colour": '"#FF0000"',
+                        "compatible_printers": '"Printer \\"A\\"";"Bambu Lab A1 0.4 nozzle"',
+                    },
+                },
+                {
+                    "id": "f4",
+                    "name": "Text after a closing quote",
+                    "content": {"type": "filament", "filament_type": "PLA", "compatible_printers": '"X1C" P1S'},
+                },
+            ]
+        )
+        svc_mock.close = AsyncMock()
+        user = MagicMock(id=1)
+        user.has_permission = MagicMock(return_value=True)
+        with (
+            patch.object(sp, "_load_orca_credentials", AsyncMock(return_value=self._orca_creds("tok"))),
+            patch.object(sp, "_build_orca_service", AsyncMock(return_value=svc_mock)),
+        ):
+            slots, _status = await sp._fetch_orca_cloud_presets(MagicMock(), user)
+
+        meta, only_quotes, escaped, bad = slots["filament"]
+        assert meta.compatible_printers == ["Bambu Lab X1 Carbon 0.4 nozzle", "Bambu Lab H2C 0.4 nozzle"]
+        assert meta.filament_type == "PLA"
+        assert meta.filament_colour is None
+        assert only_quotes.compatible_printers is None
+        assert escaped.compatible_printers == ['Printer "A"', "Bambu Lab A1 0.4 nozzle"]
+        assert escaped.filament_colour == "#FF0000"
+        # One unparseable value reads as "no data" and the rest of the listing survives.
+        assert bad.compatible_printers is None
+        assert bad.filament_type == "PLA"
+
+    @pytest.mark.asyncio
     async def test_filament_preset_carries_the_preset_it_was_saved_from(self):
         """#3403: a filament saved with only the keys the user changed states no
         material of its own; the enrich pass reads it off this parent."""
@@ -695,6 +753,9 @@ class TestFetchCloudPresets:
         assert status == "ok"
         names = [p.name for p in slots["printer"]]
         assert names == ["My X1C", "Bambu X1C Stock"]
+        # #3386: the public list is Bambu's stock presets — flagged so the
+        # listing can drop the ones Standard also has.
+        assert [p.stock for p in slots["printer"]] == [False, True]
 
     @pytest.mark.asyncio
     async def test_cache_hit_skips_cloud_call(self):
@@ -839,6 +900,84 @@ class TestFetchCloudPresets:
             await sp._fetch_cloud_presets(MagicMock(), user)
         # Two calls — first refresh, second a normal cache hit.
         assert cloud_mock.get_slicer_settings.await_count == 1
+
+
+class TestStockDuplicates:
+    """#3386: a stock Bambu Cloud preset Standard also has is listed once, under Bambu Cloud."""
+
+    @staticmethod
+    def _tiers():
+        cloud = {
+            "printer": [],
+            "process": [],
+            "filament": [
+                UnifiedPreset(id="PFUS1", name="My PLA", source="cloud"),
+                UnifiedPreset(id="GFSA00", name="Bambu PLA Basic @BBL X1C", source="cloud", stock=True),
+                UnifiedPreset(id="GFSA99", name="Bambu PLA Brand New @BBL X1C", source="cloud", stock=True),
+            ],
+        }
+        standard = {
+            "printer": [],
+            "process": [],
+            "filament": [
+                UnifiedPreset(id="std-basic", name="Bambu PLA Basic @BBL X1C", source="standard"),
+                UnifiedPreset(id="std-mine", name="My PLA", source="standard"),
+                UnifiedPreset(id="std-matte", name="Bambu PLA Matte @BBL X1C", source="standard"),
+            ],
+        }
+        return cloud, standard
+
+    def test_hides_the_standard_twin_of_a_stock_cloud_preset(self):
+        cloud, standard = self._tiers()
+        aliases = sp._stock_aliases(cloud, standard)
+        # Only a stock preset hides its twin: the user's own "My PLA" doesn't.
+        assert {k: v.model_dump() for k, v in aliases.items()} == {
+            "standard:std-basic": {"source": "cloud", "id": "GFSA00"}
+        }
+        kept = sp._drop_aliased(standard, aliases)
+        assert [p.id for p in kept["filament"]] == ["std-mine", "std-matte"]
+        # The cloud tier is left whole, the stock copy newer than the bundle included.
+        assert sp._drop_aliased(cloud, aliases) == cloud
+
+    def test_signed_out_nothing_is_hidden(self):
+        _cloud, standard = self._tiers()
+        empty = {"printer": [], "process": [], "filament": []}
+        assert sp._stock_aliases(empty, standard) == {}
+
+    @pytest.mark.asyncio
+    async def test_the_listing_drops_the_standard_twin(self):
+        cloud, standard = self._tiers()
+        empty = {"printer": [], "process": [], "filament": []}
+        with (
+            patch.object(sp, "_fetch_orca_cloud_presets", AsyncMock(return_value=(empty, "not_authenticated"))),
+            patch.object(sp, "_fetch_cloud_presets", AsyncMock(return_value=(cloud, "ok"))),
+            patch.object(sp, "_fetch_local_presets", AsyncMock(return_value=empty)),
+            patch.object(sp, "_fetch_bundled_presets", AsyncMock(return_value=standard)),
+        ):
+            response = await sp.list_unified_presets(
+                db=MagicMock(), current_user=None, api_key_cloud_owner=None, refresh=False
+            )
+        body = response.model_dump()
+        assert [p["id"] for p in body["standard"]["filament"]] == ["std-mine", "std-matte"]
+        assert [p["id"] for p in body["cloud"]["filament"]] == ["PFUS1", "GFSA00", "GFSA99"]
+        assert body["stock_aliases"] == {"standard:std-basic": {"source": "cloud", "id": "GFSA00"}}
+
+    @pytest.mark.asyncio
+    async def test_slicing_from_stored_refs_uses_the_same_map(self):
+        cloud, standard = self._tiers()
+        with (
+            patch.object(sp, "_fetch_cloud_presets", AsyncMock(return_value=(cloud, "ok"))),
+            patch.object(sp, "_fetch_bundled_presets", AsyncMock(return_value=standard)),
+        ):
+            aliases = await sp.load_stock_aliases(MagicMock(), None)
+        hidden = sp.listed_ref(aliases, PresetRef(source="standard", id="std-basic"))
+        assert hidden.model_dump() == {"source": "cloud", "id": "GFSA00"}
+        listed = PresetRef(source="standard", id="std-matte")
+        assert sp.listed_ref(aliases, listed) is listed
+
+    def test_stock_flag_stays_out_of_the_response(self):
+        preset = UnifiedPreset(id="GFSA99", name="x", source="cloud", stock=True)
+        assert "stock" not in preset.model_dump()
 
 
 class TestFetchBundledPresets:

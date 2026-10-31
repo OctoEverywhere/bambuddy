@@ -391,13 +391,13 @@ async def test_the_layer_timelapse_is_attached_for_the_run_that_ended(test_engin
 async def test_the_registered_mapping_is_drained_when_the_printer_reported_one(test_engine, db_session, queued_print):
     """PAM/I3: left behind, the archive's next run (sent without a mapping)
     would charge its usage through this run's trays."""
-    main_module._print_ams_mappings[queued_print["archive"]] = [4]
+    main_module._print_ams_mappings[(queued_print["printer"], queued_print["archive"])] = [4]
     try:
         await _complete(test_engine, queued_print["printer"], "completed", extra={"ams_mapping": [0]})
 
-        assert queued_print["archive"] not in main_module._print_ams_mappings
+        assert (queued_print["printer"], queued_print["archive"]) not in main_module._print_ams_mappings
     finally:
-        main_module._print_ams_mappings.pop(queued_print["archive"], None)
+        main_module._print_ams_mappings.pop((queued_print["printer"], queued_print["archive"]), None)
 
 
 async def test_a_hung_sd_cleanup_does_not_hold_up_the_print_s_end(test_engine, db_session, queued_print, monkeypatch):

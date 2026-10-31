@@ -22,10 +22,11 @@ GONE, KEPT = 5, 6
 # Module-level maps in main.py that are not keyed by a printer, or are kept on
 # purpose. Anything else main.py adds must be forgotten with the printer.
 NOT_FORGOTTEN = {
-    "_print_ams_mappings": "keyed by archive (dropped with the printer's expected/active prints)",
-    "_print_cost_center_ids": "keyed by archive (dropped with the printer's expected/active prints)",
-    "_print_plate_ids": "keyed by archive (dropped with the printer's expected/active prints)",
+    "_print_ams_mappings": "keyed by (printer, archive); checked below",
+    "_print_cost_center_ids": "keyed by (printer, archive); checked below",
+    "_print_plate_ids": "keyed by (printer, archive); checked below",
     "_owned_print_archive_ids": "keyed by archive (dropped with the printer's expected/active prints)",
+    "_archive_runs_finishing": "keyed by archive, cleared by the task it counts when that task ends",
     "_ams_assignment_locks": "a lock carries nothing over; popping one a task holds would let a second be made",
     "_fallback_recovery_locks": "a lock carries nothing over (see its comment on popping)",
     "_HMS_FAILURE_REASONS": "constant",
@@ -119,9 +120,11 @@ async def test_forget_printer_clears_main_and_keeps_other_printers():
     for name in gone:
         _put(name, *gone[name])
         _put(name, *kept[name])
-    main._print_ams_mappings[100 + GONE] = [0]
-    main._print_cost_center_ids[200 + GONE] = 1
-    main._print_plate_ids[200 + GONE] = 2
+    main._print_ams_mappings[(GONE, 100)] = [0]
+    main._print_cost_center_ids[(GONE, 200)] = 1
+    main._print_plate_ids[(GONE, 200)] = 2
+    # Another printer's print of the same archive keeps what it registered.
+    main._print_plate_ids[(KEPT, 200)] = 3
     pending = {name: gone[name][1] for name in ("_printer_offline_notify_tasks", "_fallback_3mf_retry_tasks")}
     try:
         await main.forget_printer(GONE)
@@ -130,12 +133,14 @@ async def test_forget_printer_clears_main_and_keeps_other_printers():
         assert left == []
         lost = [name for name in kept if not _has(name, kept[name][0])]
         assert lost == []
-        assert 100 + GONE not in main._print_ams_mappings
-        assert 200 + GONE not in main._print_cost_center_ids
-        assert 200 + GONE not in main._print_plate_ids
+        assert (GONE, 100) not in main._print_ams_mappings
+        assert (GONE, 200) not in main._print_cost_center_ids
+        assert (GONE, 200) not in main._print_plate_ids
+        assert main._print_plate_ids.get((KEPT, 200)) == 3
         await asyncio.sleep(0)
         assert all(task.cancelled() for task in pending.values())
     finally:
+        main._print_plate_ids.pop((KEPT, 200), None)
         for entries in (gone, kept):
             for name, (key, value) in entries.items():
                 target = getattr(main, name)

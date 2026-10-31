@@ -1230,6 +1230,7 @@ export default {
         duration: "Тривалість",
         filament: "Філамент",
         cost: "Вартість",
+        plate: "Пластина",
       },
       status: {
         completed: "Виконано",
@@ -1855,6 +1856,7 @@ export default {
     exportFailed: "Помилка експорту",
     layoutReset: "Розташування віджетів скинуто",
     recalculatedCosts: "Перераховано вартість архівів: {{count}}",
+    recalculateSpoolmanUnreachable: 'Spoolman недоступний: {{count}} записів витрати його котушок зберегли стару ціну',
     recalculateFailed: "Не вдалося перерахувати витрати",
     // Loading
     loadingStats: "Завантаження статистики...",
@@ -4870,6 +4872,9 @@ export default {
     presetsHidden: 'приховано: {{count}}',
     showAllPresets: 'Показати всі',
     showFewerPresets: 'Показати менше',
+    searchPresets: "Шукати профілі...",
+    closeSearch: "Закрити пошук",
+    noMatchingPresets: "Відповідних профілів не знайдено.",
     processSettings: 'Параметри процесу',
     processSettingsHint: 'Налаштуйте вибраний профіль для цього нарізання. Усе, чого ви не змінили, лишається як визначено профілем.',
     processSettingsChanged: 'змінено: {{count}}',
@@ -7453,6 +7458,7 @@ export default {
       assignToAms: "Призначити AMS",
       syncWeight: "Синхронізувати вагу",
       addToInventory: "Додати в інвентар",
+      quickAddFromTag: 'Додає цю котушку з даними, зчитаними з її мітки Bambu. Пізніше їх можна змінити в Bambuddy.',
       assignToAmsTitle: "Призначити AMS",
       selectSlot: "Вибрати слот",
       assign: "Призначити",
@@ -7685,6 +7691,9 @@ export default {
         skip: "Не працює в контейнері — не застосовується.",
         skip_unknown: "Bambuddy працює в {{runtime}}, але визначити мережевий режим не вдалося. Якщо виявлення принтерів або віртуальний принтер не працюють, повторно створіть контейнер із мережею хоста.",
         skip_system_container: "Bambuddy працює в системному контейнері {{runtime}}, який перебуває в локальній мережі як віртуальна машина — не застосовується.",
+        pass_macvlan: "Працює в {{runtime}} у мережі macvlan, із власною адресою в локальній мережі.",
+        pass_ipvlan: "Працює в {{runtime}} у мережі ipvlan (L2), із власною адресою в локальній мережі.",
+        warn_ipvlan_l3: "Bambuddy працює в {{runtime}} у мережі ipvlan у режимі L3. Режим L3 не пропускає широкомовні та багатоадресні пакети, тому слайсер не знайде віртуальний принтер, а принтери можна знайти лише скануванням підмережі — використовуйте мережу macvlan або режим ipvlan L2.",
       },
       subnet: {
         title: "Мережева підмережа",

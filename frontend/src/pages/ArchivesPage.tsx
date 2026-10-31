@@ -922,8 +922,19 @@ function ArchiveCard({
             src={
               currentPlateIndex !== null && plates.length > 0
                 ? api.getArchivePlateThumbnail(archive.id, plates[displayPlateIndex]?.index ?? 0)
-                : api.getArchiveThumbnail(archive.id)
+                : // The plate the title names: a file printed again shows its
+                  // latest run's plate, the stored picture is the first's.
+                  archive.plate_id != null && archive.plate_id > 1
+                  ? api.getArchivePlateThumbnail(archive.id, archive.plate_id)
+                  : api.getArchiveThumbnail(archive.id)
             }
+            onError={(e) => {
+              // A file without per-plate pictures: the stored one.
+              const img = e.currentTarget;
+              if (img.dataset.fellBack) return;
+              img.dataset.fellBack = '1';
+              img.src = api.getArchiveThumbnail(archive.id);
+            }}
             loading="lazy"
             alt={archive.print_name || archive.filename}
             className="w-full h-full object-cover"

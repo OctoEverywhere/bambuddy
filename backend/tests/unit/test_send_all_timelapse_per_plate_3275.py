@@ -230,13 +230,13 @@ class TestEviction:
         m._evict_stale_expected_prints()
 
         assert (1, "Plates.gcode") not in m._expected_prints
-        assert m._print_plate_ids[42] == 2
-        assert m._print_ams_mappings[42] == [0]
+        assert m._print_plate_ids[(1, 42)] == 2
+        assert m._print_ams_mappings[(1, 42)] == [0]
 
     def test_a_print_that_never_started_still_releases_it(self):
         m = self._register_and_start()
 
         m._evict_stale_expected_prints()
 
-        assert 42 not in m._print_plate_ids
-        assert 42 not in m._print_ams_mappings
+        assert (1, 42) not in m._print_plate_ids
+        assert (1, 42) not in m._print_ams_mappings

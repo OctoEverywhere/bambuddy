@@ -1233,6 +1233,7 @@ export default {
         duration: 'Duration',
         filament: 'Filament',
         cost: 'Cost',
+        plate: 'Plate',
       },
       status: {
         completed: 'Completed',
@@ -1859,6 +1860,7 @@ export default {
     exportFailed: 'Export failed',
     layoutReset: 'Layout reset',
     recalculatedCosts: 'Recalculated costs for {{count}} archives',
+    recalculateSpoolmanUnreachable: 'Spoolman could not be reached: {{count}} usage records of its spools kept their old price',
     recalculateFailed: 'Failed to recalculate costs',
     // Loading
     loadingStats: 'Loading statistics...',
@@ -4875,6 +4877,9 @@ export default {
     presetsHidden: '{{count}} hidden',
     showAllPresets: 'Show all',
     showFewerPresets: 'Show fewer',
+    searchPresets: 'Search presets...',
+    closeSearch: 'Close search',
+    noMatchingPresets: 'No matching presets found.',
     processSettings: 'Process settings',
     processSettingsHint: "Adjust the picked preset for this slice. Anything you don't touch stays as the preset defines it.",
     processSettingsChanged: '{{count}} changed',
@@ -7465,6 +7470,7 @@ export default {
       assignToAms: 'Assign to AMS',
       syncWeight: 'Sync Weight',
       addToInventory: 'Add to Inventory',
+      quickAddFromTag: 'Adds this spool with the details read from its Bambu tag. You can edit them later in Bambuddy.',
       assignToAmsTitle: 'Assign to AMS',
       selectSlot: 'Select a slot',
       assign: 'Assign',
@@ -7697,6 +7703,9 @@ export default {
         skip: 'Not running in a container — not applicable.',
         skip_unknown: 'Bambuddy is running in {{runtime}}, but its network mode could not be determined. If printer discovery or the Virtual Printer do not work, recreate the container with host networking.',
         skip_system_container: 'Bambuddy is running in a {{runtime}} system container, which sits on the LAN like a virtual machine — not applicable.',
+        pass_macvlan: 'Running in {{runtime}} on a macvlan network, with its own address on the LAN.',
+        pass_ipvlan: 'Running in {{runtime}} on an ipvlan network (L2), with its own address on the LAN.',
+        warn_ipvlan_l3: 'Bambuddy is running in {{runtime}} on an ipvlan network in L3 mode. L3 mode passes no broadcast or multicast, so the slicer cannot find the Virtual Printer and printers can only be found with the subnet scan — use a macvlan network or ipvlan L2 mode instead.',
       },
       subnet: {
         title: 'Network subnet',

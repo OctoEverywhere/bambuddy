@@ -1231,6 +1231,7 @@ export default {
         duration: 'Duur',
         filament: 'Filament',
         cost: 'Kosten',
+        plate: 'Plaat',
       },
       status: {
         completed: 'Voltooid',
@@ -1857,6 +1858,7 @@ export default {
     exportFailed: 'Export mislukt',
     layoutReset: 'Indeling gereset',
     recalculatedCosts: 'Kosten voor {{count}} archieven opnieuw berekend',
+    recalculateSpoolmanUnreachable: 'Spoolman was niet bereikbaar: {{count}} verbruiksregistraties van zijn spoelen houden hun oude prijs',
     recalculateFailed: 'Kosten opnieuw berekenen mislukt',
     // Loading
     loadingStats: 'Statistieken laden...',
@@ -4873,6 +4875,9 @@ export default {
     presetsHidden: '{{count}} verborgen',
     showAllPresets: 'Alles tonen',
     showFewerPresets: 'Minder tonen',
+    searchPresets: 'Presets zoeken...',
+    closeSearch: 'Zoeken sluiten',
+    noMatchingPresets: 'Geen overeenkomende presets gevonden.',
     processSettings: 'Procesinstellingen',
     processSettingsHint: 'Pas de gekozen preset aan voor deze slice. Alles wat je niet aanraakt blijft zoals de preset het definieert.',
     processSettingsChanged: '{{count}} gewijzigd',
@@ -7463,6 +7468,7 @@ export default {
       assignToAms: 'Aan AMS toewijzen',
       syncWeight: 'Gewicht synchroniseren',
       addToInventory: 'Aan voorraad toevoegen',
+      quickAddFromTag: 'Voegt deze spoel toe met de gegevens van de Bambu-tag. Je kunt ze later in Bambuddy aanpassen.',
       assignToAmsTitle: 'Aan AMS toewijzen',
       selectSlot: 'Selecteer een slot',
       assign: 'Toewijzen',
@@ -7695,6 +7701,9 @@ export default {
         skip: 'Draait niet in een container — niet van toepassing.',
         skip_unknown: 'Bambuddy draait in {{runtime}}, maar de netwerkmodus kon niet worden bepaald. Als printerdetectie of de Virtuele printer niet werken, maak de container dan opnieuw aan met host-netwerk.',
         skip_system_container: 'Bambuddy draait in een {{runtime}}-systeemcontainer, die net als een virtuele machine op het LAN zit — niet van toepassing.',
+        pass_macvlan: 'Draait in {{runtime}} op een macvlan-netwerk, met een eigen adres op het LAN.',
+        pass_ipvlan: 'Draait in {{runtime}} op een ipvlan-netwerk (L2), met een eigen adres op het LAN.',
+        warn_ipvlan_l3: 'Bambuddy draait in {{runtime}} op een ipvlan-netwerk in L3-modus. L3-modus laat geen broadcast of multicast door, dus de slicer vindt de virtuele printer niet en printers zijn alleen met de subnetscan te vinden — gebruik in plaats daarvan een macvlan-netwerk of ipvlan L2-modus.',
       },
       subnet: {
         title: 'Netwerksubnet',

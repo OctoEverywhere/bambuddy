@@ -4074,6 +4074,38 @@ async def test_stop_offline_reconciles_linked_archive_status_2603(
 
 
 @pytest.mark.asyncio
+async def test_stop_offline_logs_the_run_with_the_items_plate(
+    async_client: AsyncClient, printer_factory, archive_factory, db_session
+):
+    """The run's own plate is the queue item's: the archive's is only its
+    latest run's, and a reprint of another plate may not have changed it."""
+    from unittest.mock import MagicMock, patch
+
+    from sqlalchemy import select
+
+    from backend.app.models.print_log import PrintLogEntry
+    from backend.app.models.print_queue import PrintQueueItem
+
+    printer = await printer_factory(name="Offline printer")
+    archive = await archive_factory(printer.id, status="printing", plate_id=1, with_run=False)
+    item = PrintQueueItem(printer_id=printer.id, archive_id=archive.id, status="printing", plate_id=3)
+    db_session.add(item)
+    await db_session.commit()
+
+    with patch(
+        "backend.app.services.printer_manager.printer_manager.stop_print",
+        MagicMock(return_value=False),
+    ):
+        resp = await async_client.post(f"/api/v1/queue/{item.id}/stop")
+
+    assert resp.status_code == 200
+    plates = list(
+        await db_session.scalars(select(PrintLogEntry.plate_id).where(PrintLogEntry.archive_id == archive.id))
+    )
+    assert plates == [3]
+
+
+@pytest.mark.asyncio
 async def test_stop_online_leaves_archive_for_mqtt_to_reconcile_2603(
     async_client: AsyncClient, printer_factory, archive_factory, db_session
 ):
